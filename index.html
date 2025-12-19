@@ -1,0 +1,5032 @@
+<!--LEGAL-DNA:{"jurisdiction":"US/MN/Baxter","export_tag":"EAR99","spdx":"MIT","artifact_time":1766185086197,"def_pub":"OIN","consent_req":true,"city":"Baxter"}-->
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
+  <meta name="theme-color" content="#0b0b0f"/>
+
+  <!--
+    vNext Upgrade (single-file, offline-only)
+    App: Camera Color Trigger + Palette Builder
+    Build: 2025-12-19
+    Changelog (high-level):
+      - Robust camera lifecycle + constraints fallback ladder with diagnostics
+      - ROI mapping fixed for object-fit:contain letterboxing + DPR; ROI presets modal + reset + center lock
+      - Sampling: adaptive downscale, robust trimmed mean, buffer reuse, governor stability + dropped-sample reporting
+      - Trigger: hold time + cooldown, hue center/width mode, confidence score, improved flicker detection (freq hint)
+      - Palette: persistence + schema migration, better eviction metric, improved search parsing, perceptual-ish clustering/merge
+      - Export: selected-only, bundle manifest w/ device/settings, iOS download fallback to clipboard/modal
+      - Accessibility: ARIA polish, focus trap for modals, ESC close, safer touch listeners
+  -->
+
+  <!-- Security hardening: self-contained, offline-only -->
+  <meta http-equiv="Content-Security-Policy" content="
+    default-src 'self' blob: data:;
+    base-uri 'none';
+    object-src 'none';
+    frame-ancestors 'none';
+    form-action 'none';
+    connect-src 'none';
+    img-src 'self' blob: data:;
+    media-src 'self' blob: data:;
+    style-src 'self' 'unsafe-inline';
+    script-src 'self' 'unsafe-inline';
+  ">
+  <meta http-equiv="Permissions-Policy" content="camera=(self), microphone=()">
+
+  <title>Camera Color Trigger + Palette Builder (Offline)</title>
+
+  <style>
+    :root{
+      --bg:#0b0b0f;
+      --panel:#141422;
+      --panel2:#10101a;
+      --ink:#e9e9f4;
+      --muted:#a7a7c7;
+      --line:#2a2a45;
+
+      --accent:#ff7a18;
+      --good:#4ade80;
+      --bad:#fb7185;
+      --warn:#fbbf24;
+
+      --shadow: 0 12px 35px rgba(0,0,0,.45);
+      --r:16px;
+
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      --sans: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+
+      --tap: 48px;
+      --navH: calc(62px + env(safe-area-inset-bottom,0px));
+      --sheetRadius: 22px;
+
+      --sheetSnap20: 0.80;
+      --sheetSnap55: 0.45;
+      --sheetSnap90: 0.10;
+      --sheetY: calc(var(--sheetSnap55) * 100%);
+    }
+
+    *{ box-sizing:border-box; }
+    html,body{ height:100%; margin:0; background:var(--bg); color:var(--ink); font-family:var(--sans); }
+    button,input,select{ font:inherit; }
+    a{ color:inherit; }
+    .sr{ position:absolute; left:-9999px; width:1px; height:1px; overflow:hidden; }
+
+    body{ overscroll-behavior: none; }
+    .scrollY{ overflow:auto; -webkit-overflow-scrolling: touch; }
+
+    .app{
+      position:fixed; inset:0;
+      padding:
+        env(safe-area-inset-top,0px)
+        env(safe-area-inset-right,0px)
+        0
+        env(safe-area-inset-left,0px);
+      display:flex;
+      flex-direction:column;
+      gap:0;
+    }
+
+    .stageWrap{
+      position:relative;
+      flex:1 1 auto;
+      min-height: 260px;
+      background:#000;
+    }
+    .stage{
+      position:absolute; inset:0;
+      background:#000;
+      touch-action:none;
+      user-select:none;
+    }
+    video#vid, video#vidLand{
+      position:absolute; inset:0;
+      width:100%; height:100%;
+      object-fit:contain;
+      background:#000;
+    }
+    .overlay{
+      position:absolute; inset:0;
+      pointer-events:none;
+    }
+
+    .roi{
+      position:absolute;
+      left: 34%;
+      top: 34%;
+      width: 32%;
+      height: 22%;
+      border: 2px solid rgba(255,122,24,.95);
+      border-radius:16px;
+      background: rgba(255,122,24,.06);
+      box-shadow: 0 0 0 2000px rgba(0,0,0,.18) inset, 0 0 0 2px rgba(0,0,0,.55);
+      pointer-events:auto;
+      touch-action:none;
+      will-change: transform, left, top, width, height;
+    }
+    .roi.locked{
+      border-color: rgba(255,255,255,.22);
+      background: rgba(255,255,255,.04);
+    }
+    .roi .handle{
+      position:absolute;
+      width:22px; height:22px;
+      border-radius:10px;
+      background: rgba(255,122,24,.95);
+      box-shadow: 0 0 0 3px rgba(0,0,0,.55);
+    }
+    .roi.locked .handle{ display:none; }
+    .h-tl{ left:-11px; top:-11px; cursor:nwse-resize; }
+    .h-tr{ right:-11px; top:-11px; cursor:nesw-resize; }
+    .h-bl{ left:-11px; bottom:-11px; cursor:nesw-resize; }
+    .h-br{ right:-11px; bottom:-11px; cursor:nwse-resize; }
+
+    .roi .cap{
+      position:absolute; left:10px; top:10px;
+      padding:6px 10px;
+      border-radius:999px;
+      background: rgba(0,0,0,.55);
+      border: 1px solid rgba(255,255,255,.12);
+      color:#fff;
+      font-size:12px;
+      font-family:var(--mono);
+      display:flex; align-items:center; gap:8px;
+      max-width: calc(100% - 20px);
+      overflow:hidden;
+      text-overflow:ellipsis;
+      white-space:nowrap;
+    }
+    .cap .miniDot{ width:10px; height:10px; border-radius:999px; background:var(--warn); box-shadow: 0 0 0 2px rgba(255,255,255,.06) inset; }
+
+    .hud{
+      position:absolute;
+      left:12px; right:12px;
+      top:12px;
+      display:flex;
+      justify-content:space-between;
+      gap:10px;
+      pointer-events:none;
+    }
+    .hud .pill{
+      pointer-events:none;
+      display:inline-flex; align-items:center; gap:8px;
+      padding:8px 10px;
+      border-radius:999px;
+      background: rgba(15,15,24,.65);
+      border: 1px solid rgba(255,255,255,.10);
+      color: #fff;
+      font-family: var(--mono);
+      font-size: 12px;
+      backdrop-filter: blur(6px);
+      max-width: 48%;
+      white-space:nowrap;
+      overflow:hidden;
+      text-overflow:ellipsis;
+    }
+    .dot{ width:10px; height:10px; border-radius:999px; background:var(--warn); box-shadow:0 0 0 2px rgba(255,255,255,.06) inset; }
+    .dot.good{ background:var(--good); }
+    .dot.bad{ background:var(--bad); }
+    .dot.warn{ background:var(--warn); }
+
+    .bottomNav{
+      position:fixed;
+      left:0; right:0; bottom:0;
+      height: var(--navH);
+      padding: 10px 12px calc(10px + env(safe-area-inset-bottom,0px)) 12px;
+      background: rgba(10,10,16,.92);
+      border-top: 1px solid rgba(255,255,255,.10);
+      display:flex;
+      gap:10px;
+      justify-content:space-between;
+      z-index: 50;
+      backdrop-filter: blur(10px);
+    }
+    .navBtn{
+      height: var(--tap);
+      flex:1 1 0;
+      border-radius: 16px;
+      border: 1px solid rgba(255,255,255,.10);
+      background: rgba(255,255,255,.04);
+      color: var(--muted);
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      gap:8px;
+      font-size: 13px;
+      font-family: var(--mono);
+      cursor:pointer;
+      user-select:none;
+      touch-action: manipulation;
+    }
+    .navBtn.on{
+      color: var(--ink);
+      border-color: rgba(255,122,24,.50);
+      background: rgba(255,122,24,.12);
+    }
+    .navBtn:focus-visible{ outline: 2px solid rgba(255,122,24,.55); outline-offset: 2px; }
+    .navIco{
+      width:18px; height:18px; display:inline-block;
+      opacity:.95;
+    }
+
+    .sheet{
+      position:fixed;
+      left:0; right:0;
+      top:0; bottom:0;
+      transform: translateY(var(--sheetY));
+      transition: transform .18s ease;
+      z-index: 40;
+      pointer-events:none;
+    }
+    .sheetInner{
+      position:absolute;
+      left:0; right:0; bottom: var(--navH);
+      height: calc(100% - 0px);
+      background: linear-gradient(180deg, rgba(20,20,34,.98), rgba(16,16,26,.98));
+      border-top-left-radius: var(--sheetRadius);
+      border-top-right-radius: var(--sheetRadius);
+      border: 1px solid rgba(255,255,255,.10);
+      box-shadow: var(--shadow);
+      pointer-events:auto;
+      display:flex;
+      flex-direction:column;
+      overflow:hidden;
+    }
+    .sheetGrab{
+      height: 54px;
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      padding: 10px 12px;
+      border-bottom: 1px solid rgba(255,255,255,.08);
+      background: rgba(0,0,0,.12);
+      touch-action:none;
+      user-select:none;
+    }
+    .grabBar{
+      width: 54px;
+      height: 6px;
+      border-radius: 999px;
+      background: rgba(255,255,255,.18);
+      margin: 0 auto;
+    }
+    .grabTitle{
+      display:flex; align-items:center; gap:10px;
+      font-family: var(--mono);
+      font-size: 12px;
+      color: var(--muted);
+      white-space:nowrap;
+      overflow:hidden;
+      text-overflow:ellipsis;
+    }
+    .grabBtns{
+      display:flex; gap:8px; align-items:center;
+    }
+
+    .content{
+      padding: 12px;
+      padding-bottom: 18px;
+      display:flex;
+      flex-direction:column;
+      gap: 12px;
+      overflow:auto;
+      -webkit-overflow-scrolling: touch;
+    }
+    .card{
+      background: rgba(12,12,18,.55);
+      border: 1px solid rgba(255,255,255,.10);
+      border-radius: 18px;
+      overflow:hidden;
+    }
+    .cardH{
+      padding: 12px 12px;
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:10px;
+      border-bottom: 1px solid rgba(255,255,255,.08);
+      color: var(--muted);
+      font-size: 12px;
+      font-family: var(--mono);
+      text-transform: uppercase;
+      letter-spacing: .08em;
+    }
+    .cardB{ padding: 12px; display:flex; flex-direction:column; gap: 10px; }
+
+    .row{ display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+    .row > *{ flex: 1 1 auto; }
+    .tight{ gap:8px; }
+    .field{ min-width: 160px; }
+    label{ display:block; color:var(--muted); font-size:12px; margin-bottom:6px; }
+    input[type="number"], input[type="text"], select{
+      width:100%;
+      height: var(--tap);
+      padding: 10px 12px;
+      border-radius: 16px;
+      border: 1px solid rgba(255,255,255,.12);
+      background: rgba(255,255,255,.05);
+      color: var(--ink);
+      outline:none;
+    }
+    input[type="number"]:focus-visible,
+    input[type="text"]:focus-visible,
+    select:focus-visible{ outline: 2px solid rgba(255,122,24,.55); outline-offset: 2px; }
+    input[type="range"]{ width:100%; }
+    input[type="checkbox"]{ transform: scale(1.15); }
+
+    .btn{
+      height: var(--tap);
+      padding: 0 14px;
+      border-radius: 16px;
+      border: 1px solid rgba(255,255,255,.12);
+      background: rgba(255,255,255,.05);
+      color: var(--ink);
+      cursor:pointer;
+      user-select:none;
+      display:inline-flex;
+      align-items:center;
+      justify-content:center;
+      gap:10px;
+      min-width: 44px;
+      touch-action: manipulation;
+    }
+    .btn:active{ transform: translateY(1px); }
+    .btn.primary{
+      border-color: rgba(255,122,24,.55);
+      background: rgba(255,122,24,.12);
+    }
+    .btn.good{
+      border-color: rgba(74,222,128,.55);
+      background: rgba(74,222,128,.12);
+    }
+    .btn.bad{
+      border-color: rgba(251,113,133,.55);
+      background: rgba(251,113,133,.12);
+    }
+    .btn.ghost{
+      background: transparent;
+    }
+    .btn.small{
+      height: 42px;
+      border-radius: 14px;
+      font-size: 13px;
+      padding: 0 12px;
+      font-family: var(--mono);
+      color: var(--muted);
+    }
+    .btn:focus-visible{ outline: 2px solid rgba(255,122,24,.55); outline-offset: 2px; }
+    .btn[disabled]{ opacity:.55; cursor:not-allowed; transform:none; }
+
+    .pill2{
+      display:inline-flex;
+      align-items:center;
+      gap:8px;
+      padding: 8px 10px;
+      border-radius: 999px;
+      border: 1px solid rgba(255,255,255,.12);
+      background: rgba(255,255,255,.05);
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 12px;
+      white-space:nowrap;
+      overflow:hidden;
+      text-overflow:ellipsis;
+    }
+
+    .swatchBig{
+      width: 54px; height: 54px;
+      border-radius: 18px;
+      border: 1px solid rgba(255,255,255,.12);
+      background:#111;
+      box-shadow: inset 0 0 0 2px rgba(255,255,255,.05);
+      flex: 0 0 auto;
+    }
+    .kpi{
+      display:flex;
+      align-items:center;
+      gap: 12px;
+    }
+    .kpi .vals{
+      display:flex;
+      flex-direction:column;
+      gap: 4px;
+      min-width: 0;
+    }
+    .kpi b{ font-family: var(--mono); font-size: 13px; }
+    .kpi span{ font-family: var(--mono); font-size: 12px; color: var(--muted); }
+
+    .meter{
+      height: 10px;
+      border-radius: 999px;
+      background: rgba(255,255,255,.08);
+      border: 1px solid rgba(255,255,255,.10);
+      overflow:hidden;
+    }
+    .meter > i{
+      display:block;
+      height: 100%;
+      width: 10%;
+      background: rgba(74,222,128,.85);
+    }
+
+    .hint{
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.35;
+    }
+
+    .hueBar{
+      position:relative;
+      height: 18px;
+      border-radius: 999px;
+      border: 1px solid rgba(255,255,255,.12);
+      overflow:hidden;
+      background: linear-gradient(90deg,
+        #ff0000 0%,
+        #ff7a00 8%,
+        #ffd000 16%,
+        #a8ff00 24%,
+        #00ff3a 32%,
+        #00ffb6 40%,
+        #00c8ff 48%,
+        #0060ff 56%,
+        #6a00ff 64%,
+        #d400ff 72%,
+        #ff0088 80%,
+        #ff0000 100%
+      );
+    }
+    .hueMask{
+      position:absolute; inset:0;
+      background: rgba(0,0,0,.35);
+      pointer-events:none;
+    }
+    .hueSel{
+      position:absolute; top:0; bottom:0;
+      background: rgba(255,255,255,.35);
+      pointer-events:none;
+      box-shadow: inset 0 0 0 1px rgba(255,255,255,.25);
+    }
+    .hueEdge{
+      position:absolute;
+      top:-18px;
+      font-family: var(--mono);
+      font-size: 11px;
+      color: rgba(255,255,255,.65);
+      pointer-events:none;
+    }
+    .hueEdge.left{ left:0; }
+    .hueEdge.right{ right:0; }
+    .wrapBadge{
+      display:inline-flex;
+      align-items:center;
+      gap:6px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      border: 1px solid rgba(255,255,255,.12);
+      background: rgba(255,255,255,.05);
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 12px;
+    }
+
+    .strip{
+      display:flex;
+      gap:4px;
+      align-items:center;
+      overflow:hidden;
+      border-radius: 14px;
+      padding: 8px;
+      background: rgba(0,0,0,.20);
+      border: 1px solid rgba(255,255,255,.10);
+    }
+    .seg{
+      width: 10px;
+      height: 18px;
+      border-radius: 6px;
+      background: rgba(255,255,255,.10);
+      flex: 0 0 auto;
+    }
+    .seg.on{ background: rgba(74,222,128,.70); }
+    .seg.off{ background: rgba(255,255,255,.10); }
+
+    .paletteTop{
+      display:flex; gap:10px; flex-wrap:wrap; align-items:flex-end;
+    }
+    .paletteGrid{
+      display:grid;
+      grid-template-columns: repeat(2, minmax(0,1fr));
+      gap:10px;
+    }
+    @media (min-width: 720px){
+      .paletteGrid{ grid-template-columns: repeat(3, minmax(0,1fr)); }
+    }
+    .pCard{
+      position:relative;
+      border: 1px solid rgba(255,255,255,.10);
+      border-radius: 18px;
+      overflow:hidden;
+      background: rgba(0,0,0,.20);
+      display:flex;
+      flex-direction:column;
+      min-height: 132px;
+    }
+    .pSw{
+      height: 60px;
+      border-bottom: 1px solid rgba(255,255,255,.10);
+      position:relative;
+    }
+    .pSw .chip{
+      position:absolute; left:10px; top:10px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      border: 1px solid rgba(255,255,255,.16);
+      background: rgba(0,0,0,.40);
+      color:#fff;
+      font-family: var(--mono);
+      font-size: 12px;
+    }
+    .pSw .pin{
+      position:absolute; right:10px; top:10px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      border: 1px solid rgba(255,255,255,.16);
+      background: rgba(0,0,0,.40);
+      color:#fff;
+      font-family: var(--mono);
+      font-size: 12px;
+    }
+    .pB{ padding: 10px; display:flex; flex-direction:column; gap: 6px; }
+    .pHex{ font-family: var(--mono); font-size: 13px; }
+    .pMeta{ font-family: var(--mono); font-size: 12px; color: var(--muted); }
+    .pBtns{ display:flex; gap:8px; margin-top: 4px; }
+    .pBtns .btn{ flex: 1 1 auto; height: 42px; border-radius: 14px; font-size: 13px; padding: 0 12px; }
+    .selBox{
+      position:absolute;
+      left:10px; bottom:10px;
+      width: 28px; height: 28px;
+      border-radius: 10px;
+      border: 1px solid rgba(255,255,255,.18);
+      background: rgba(0,0,0,.35);
+      display:none;
+      align-items:center;
+      justify-content:center;
+      color:#fff;
+      font-family: var(--mono);
+      font-size: 13px;
+      box-shadow: 0 0 0 2px rgba(0,0,0,.25) inset;
+    }
+    .pCard.selMode .selBox{ display:flex; }
+    .pCard.selected .selBox{
+      border-color: rgba(74,222,128,.60);
+      background: rgba(74,222,128,.22);
+    }
+
+    .log{
+      height: 260px;
+      overflow:auto;
+      padding:10px;
+      border-radius: 18px;
+      border: 1px solid rgba(255,255,255,.10);
+      background: rgba(0,0,0,.22);
+      font-family: var(--mono);
+      font-size: 12px;
+      line-height: 1.35;
+      white-space: pre;
+    }
+
+    .timeline{
+      border: 1px solid rgba(255,255,255,.10);
+      border-radius: 18px;
+      overflow:hidden;
+      background: rgba(0,0,0,.22);
+    }
+    canvas#tlCanvas{ width:100%; height: 64px; display:block; }
+    .tlRow{
+      padding: 10px;
+      display:flex;
+      gap:10px;
+      align-items:center;
+      flex-wrap:wrap;
+      border-top: 1px solid rgba(255,255,255,.08);
+    }
+
+    .modal{
+      position:fixed; inset:0;
+      display:none;
+      align-items:flex-end;
+      justify-content:center;
+      background: rgba(0,0,0,.45);
+      z-index: 100;
+      padding: 12px;
+      padding-bottom: calc(12px + env(safe-area-inset-bottom,0px));
+    }
+    .modal.on{ display:flex; }
+    .modalCard{
+      width:min(760px, 100%);
+      border-radius: 22px;
+      border: 1px solid rgba(255,255,255,.12);
+      background: linear-gradient(180deg, rgba(20,20,34,.98), rgba(16,16,26,.98));
+      box-shadow: var(--shadow);
+      overflow:hidden;
+      max-height: 80vh;
+      display:flex; flex-direction:column;
+    }
+    .modalH{
+      padding: 12px;
+      border-bottom: 1px solid rgba(255,255,255,.10);
+      display:flex;
+      justify-content:space-between;
+      align-items:center;
+      gap:10px;
+      font-family: var(--mono);
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: .08em;
+      font-size: 12px;
+    }
+    .modalB{
+      padding: 12px;
+      overflow:auto;
+      -webkit-overflow-scrolling: touch;
+      display:flex;
+      flex-direction:column;
+      gap:12px;
+    }
+    .modalB ul, .modalB ol{ margin: 6px 0 0 18px; padding: 0; color: var(--muted); }
+    .modalB li{ margin: 4px 0; }
+    .kbd{
+      font-family: var(--mono);
+      padding: 2px 8px;
+      border-radius: 10px;
+      border: 1px solid rgba(255,255,255,.14);
+      background: rgba(255,255,255,.06);
+      color: var(--ink);
+      display:inline-block;
+    }
+    .modalTextarea{
+      width:100%;
+      min-height: 220px;
+      padding: 12px;
+      border-radius: 16px;
+      border: 1px solid rgba(255,255,255,.12);
+      background: rgba(0,0,0,.22);
+      color: var(--ink);
+      font-family: var(--mono);
+      font-size: 12px;
+      line-height: 1.35;
+      resize: vertical;
+    }
+
+    .landSplit{
+      display:none;
+      position:absolute;
+      inset:0;
+      padding-bottom: var(--navH);
+    }
+    .landCam{
+      position:absolute; top:0; bottom: var(--navH);
+      left:0; width: 56%;
+      background:#000;
+      border-right: 1px solid rgba(255,255,255,.10);
+    }
+    .landCtrl{
+      position:absolute; top:0; bottom: var(--navH);
+      right:0; width:44%;
+      background: linear-gradient(180deg, rgba(20,20,34,.98), rgba(16,16,26,.98));
+      overflow:auto;
+      -webkit-overflow-scrolling: touch;
+      padding: 12px;
+      display:flex;
+      flex-direction:column;
+      gap: 12px;
+    }
+
+    @media (orientation: landscape) and (min-width: 720px){
+      .sheet{ display:none; }
+      .stageWrap{ display:none; }
+      .landSplit{ display:block; }
+    }
+
+    .toast{
+      position:fixed;
+      left:12px; right:12px;
+      bottom: calc(var(--navH) + 12px);
+      padding:10px 12px;
+      border-radius: 16px;
+      background: rgba(15,15,24,.92);
+      border: 1px solid rgba(255,255,255,.12);
+      box-shadow: var(--shadow);
+      font-family: var(--mono);
+      font-size: 12px;
+      color: var(--ink);
+      transform: translateY(16px);
+      opacity:0;
+      pointer-events:none;
+      transition: transform .18s ease, opacity .18s ease;
+      z-index: 80;
+      max-width: 900px;
+      margin: 0 auto;
+    }
+    .toast.on{ transform: translateY(0); opacity:1; }
+  </style>
+</head>
+
+<body>
+  <div class="app" id="app">
+
+    <!-- Portrait camera stage -->
+    <div class="stageWrap" id="stageWrap">
+      <div class="stage" id="stage">
+        <video id="vid" playsinline muted></video>
+
+        <div class="overlay">
+          <div class="hud">
+            <div class="pill"><span class="dot warn" id="camDot"></span><span id="camStatus">camera: idle</span></div>
+            <div class="pill"><span class="dot warn" id="fpsDot"></span><span id="fpsRead">fps: —</span></div>
+          </div>
+
+          <div id="roi" class="roi" aria-label="ROI selection" role="group">
+            <div class="cap"><span class="miniDot" id="qualDot"></span><span id="roiCap">ROI</span></div>
+            <div class="handle h-tl" data-h="tl" aria-hidden="true"></div>
+            <div class="handle h-tr" data-h="tr" aria-hidden="true"></div>
+            <div class="handle h-bl" data-h="bl" aria-hidden="true"></div>
+            <div class="handle h-br" data-h="br" aria-hidden="true"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Landscape split -->
+    <div class="landSplit" id="landSplit">
+      <div class="landCam">
+        <div class="stage" style="position:absolute; inset:0;">
+          <video id="vidLand" playsinline muted></video>
+          <div class="overlay">
+            <div class="hud">
+              <div class="pill"><span class="dot warn" id="camDotL"></span><span id="camStatusL">camera: idle</span></div>
+              <div class="pill"><span class="dot warn" id="fpsDotL"></span><span id="fpsReadL">fps: —</span></div>
+            </div>
+
+            <div id="roiL" class="roi" aria-label="ROI selection (landscape)" role="group">
+              <div class="cap"><span class="miniDot" id="qualDotL"></span><span id="roiCapL">ROI</span></div>
+              <div class="handle h-tl" data-h="tl" aria-hidden="true"></div>
+              <div class="handle h-tr" data-h="tr" aria-hidden="true"></div>
+              <div class="handle h-bl" data-h="bl" aria-hidden="true"></div>
+              <div class="handle h-br" data-h="br" aria-hidden="true"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="landCtrl" id="landCtrl">
+        <!-- JS mounts active panel here in landscape -->
+      </div>
+    </div>
+
+    <!-- Portrait bottom sheet -->
+    <div class="sheet" id="sheet">
+      <div class="sheetInner">
+        <div class="sheetGrab" id="sheetGrab" aria-label="Bottom sheet drag handle">
+          <div class="grabTitle" id="sheetTitle">
+            <span class="grabBar" aria-hidden="true"></span>
+            <span class="sr">Drag to resize sheet</span>
+          </div>
+          <div class="grabBtns">
+            <button class="btn small ghost" id="btnHelp" title="Help" aria-label="Help">Help</button>
+            <button class="btn small ghost" id="btnSnap" title="Snap" aria-label="Snap sheet height">Snap</button>
+          </div>
+        </div>
+        <div class="content scrollY" id="sheetContent"></div>
+      </div>
+    </div>
+
+    <!-- Bottom nav -->
+    <div class="bottomNav" role="navigation" aria-label="Bottom navigation">
+      <button class="navBtn on" id="tabScan" aria-pressed="true" aria-label="Scan tab">
+        <span class="navIco" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
+            <rect x="4" y="6" width="16" height="12" rx="3"></rect>
+            <path d="M9 6l1.2-2h3.6L15 6"></path>
+            <circle cx="12" cy="12" r="3"></circle>
+          </svg>
+        </span>
+        Scan
+      </button>
+      <button class="navBtn" id="tabTrigger" aria-pressed="false" aria-label="Trigger tab">
+        <span class="navIco" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M12 2v4"></path><path d="M12 18v4"></path>
+            <path d="M4.93 4.93l2.83 2.83"></path><path d="M16.24 16.24l2.83 2.83"></path>
+            <path d="M2 12h4"></path><path d="M18 12h4"></path>
+            <path d="M4.93 19.07l2.83-2.83"></path><path d="M16.24 7.76l2.83-2.83"></path>
+            <circle cx="12" cy="12" r="3"></circle>
+          </svg>
+        </span>
+        Trigger
+      </button>
+      <button class="navBtn" id="tabPalette" aria-pressed="false" aria-label="Palette tab">
+        <span class="navIco" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M12 22a10 10 0 1 1 7.07-17.07c1.2 1.2 1.2 3.15 0 4.35l-.7.7a2.5 2.5 0 0 0 0 3.54l.2.2A3 3 0 0 1 16.46 19H12z"></path>
+            <circle cx="7.5" cy="10.5" r="1"></circle>
+            <circle cx="10.5" cy="7.5" r="1"></circle>
+            <circle cx="14.5" cy="7.5" r="1"></circle>
+            <circle cx="16.5" cy="10.5" r="1"></circle>
+          </svg>
+        </span>
+        Palette
+      </button>
+      <button class="navBtn" id="tabExport" aria-pressed="false" aria-label="Export tab">
+        <span class="navIco" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M12 3v10"></path><path d="M8 9l4 4 4-4"></path>
+            <path d="M5 21h14"></path>
+          </svg>
+        </span>
+        Export
+      </button>
+    </div>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+    <!-- Help modal -->
+    <div class="modal" id="helpModal" role="dialog" aria-modal="true" aria-label="Help">
+      <div class="modalCard" role="document">
+        <div class="modalH">
+          <span>Help (20s onboarding)</span>
+          <button class="btn small ghost" id="btnHelpClose" aria-label="Close help">Close</button>
+        </div>
+        <div class="modalB">
+          <div class="hint">
+            <b style="color:var(--ink); font-family:var(--mono);">Fast start</b>
+            <ol>
+              <li>Go to <span class="kbd">Scan</span> → tap <span class="kbd">Start</span>.</li>
+              <li>Drag/resize ROI onto the exact patch/LED you care about.</li>
+              <li>Use <span class="kbd">Lock ROI</span> so you don’t bump it.</li>
+              <li>Tap <span class="kbd">Capture</span> to add a color; or enable Auto-add.</li>
+              <li>Go to <span class="kbd">Trigger</span> → set Hue range + S/V mins → <span class="kbd">Arm</span>.</li>
+            </ol>
+          </div>
+
+          <div class="hint">
+            <b style="color:var(--ink); font-family:var(--mono);">Fix common failures</b>
+            <ul>
+              <li><b>Hue drifts</b> (AWB): narrow ROI, raise S min, capture <span class="kbd">White/Gray Ref</span>.</li>
+              <li><b>LED flicker/PWM</b>: lower Hz preset, increase hold/debounce; check Flicker hint.</li>
+              <li><b>Red wrap</b> near 0°/360°: set min high and max low (wrap auto-handled).</li>
+              <li><b>Lag/jank</b>: governor drops Hz; enable <span class="kbd">Safe mode</span>.</li>
+              <li><b>No camera</b>: permission denied or unsupported; use a compatible browser.</li>
+            </ul>
+          </div>
+
+          <div class="hint">
+            <b style="color:var(--ink); font-family:var(--mono);">Privacy</b><br/>
+            Offline-only. No network calls. All data stays in this file + your device storage.
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ROI presets modal -->
+    <div class="modal" id="roiModal" role="dialog" aria-modal="true" aria-label="ROI presets">
+      <div class="modalCard" role="document">
+        <div class="modalH">
+          <span>ROI presets</span>
+          <button class="btn small ghost" id="btnRoiClose" aria-label="Close ROI presets">Close</button>
+        </div>
+        <div class="modalB">
+          <div class="row tight">
+            <div class="field" style="min-width:220px;">
+              <label>Preset list (per camera)</label>
+              <select id="roiPresetList" aria-label="ROI preset list"></select>
+            </div>
+            <button class="btn" id="btnRoiLoad" aria-label="Load ROI preset">Load</button>
+            <button class="btn bad" id="btnRoiDelete" aria-label="Delete ROI preset">Delete</button>
+          </div>
+
+          <div class="row tight">
+            <div class="field" style="min-width:240px;">
+              <label>Save current ROI as</label>
+              <input id="roiPresetName" type="text" placeholder="e.g. CloseUp" maxlength="24" aria-label="ROI preset name"/>
+            </div>
+            <button class="btn primary" id="btnRoiSave" aria-label="Save ROI preset">Save</button>
+            <button class="btn" id="btnRoiOverwrite" aria-label="Overwrite selected preset">Overwrite selected</button>
+          </div>
+
+          <div class="row tight">
+            <button class="btn" id="btnRoiReset" aria-label="Reset ROI to default">Reset ROI</button>
+            <span class="pill2" id="roiCamKeyRead">camera: —</span>
+          </div>
+
+          <div class="hint">
+            Presets are stored relative to the <b>visible video content</b> (object-fit: contain). This prevents ROI drift under letterboxing and orientation changes.
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Export fallback modal -->
+    <div class="modal" id="exportFallbackModal" role="dialog" aria-modal="true" aria-label="Export fallback">
+      <div class="modalCard" role="document">
+        <div class="modalH">
+          <span>Export fallback</span>
+          <button class="btn small ghost" id="btnExpFbClose" aria-label="Close export fallback">Close</button>
+        </div>
+        <div class="modalB">
+          <div class="hint">
+            Some browsers (notably iOS Safari) may block Blob downloads. This fallback keeps everything offline:
+            copy the contents below to a file, or use the copy button.
+          </div>
+          <textarea class="modalTextarea" id="exportFallbackText" aria-label="Export text"></textarea>
+          <div class="row tight">
+            <button class="btn primary" id="btnExpFbCopy" aria-label="Copy export text">Copy</button>
+            <button class="btn" id="btnExpFbSelect" aria-label="Select all export text">Select all</button>
+          </div>
+          <div class="hint" id="exportFallbackMeta">—</div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <script>
+  (() => {
+    "use strict";
+
+    /* =========================================================
+      Offline Camera Color Trigger + Palette Builder (vNext)
+      - ONE file, NO network calls, CSP connect-src none
+      - Mobile-first: portrait bottom sheet + landscape split
+      - Performance & reliability hardened
+    ========================================================= */
+
+    /* ---------------------------- Version ---------------------------- */
+    const APP = {
+      name: "Camera Color Trigger + Palette Builder",
+      schema: 4,
+      build: "2025-12-19",
+      keyState: "cc_trigger_palette_state_v4",
+      keyPalette: "cc_trigger_palette_items_v4"
+    };
+
+    /* ---------------------------- Helpers ---------------------------- */
+    const $ = (id) => document.getElementById(id);
+
+    const clamp = (x,a,b)=> {
+      x = Number(x);
+      if (!Number.isFinite(x)) return a;
+      return Math.max(a, Math.min(b, x));
+    };
+    const intClamp = (x,a,b)=> (clamp(Math.round(Number(x)), a, b) | 0);
+    const fmt = (n, d=2)=> Number.isFinite(n) ? n.toFixed(d) : "—";
+    const nowISO = ()=> new Date().toISOString();
+    const to2 = (x)=> x.toString(16).padStart(2,"0");
+    const rgbToHex = (r,g,b)=> "#" + to2(r) + to2(g) + to2(b);
+
+    function safeJsonParse(s, fallback){
+      try{
+        const v = JSON.parse(s);
+        return (v && typeof v === "object") ? v : fallback;
+      }catch(_){ return fallback; }
+    }
+
+    function deepMerge(dst, src){
+      for (const k in src){
+        const sv = src[k];
+        const dv = dst[k];
+        if (sv && typeof sv === "object" && !Array.isArray(sv) && dv && typeof dv === "object" && !Array.isArray(dv)){
+          deepMerge(dv, sv);
+        } else {
+          dst[k] = sv;
+        }
+      }
+      return dst;
+    }
+
+    function rgbToHsv(r,g,b){
+      r/=255; g/=255; b/=255;
+      const max = Math.max(r,g,b), min = Math.min(r,g,b);
+      const d = max - min;
+      let h = 0;
+      if (d !== 0){
+        if (max === r) h = ((g - b) / d) % 6;
+        else if (max === g) h = ((b - r) / d) + 2;
+        else h = ((r - g) / d) + 4;
+        h *= 60;
+        if (h < 0) h += 360;
+      }
+      const s = (max === 0) ? 0 : (d / max);
+      const v = max;
+      return {h, s, v};
+    }
+
+    function circHueDelta(a,b){
+      let d = a - b;
+      d = ((d + 540) % 360) - 180;
+      return d;
+    }
+
+    function hueInRange(h, min, max){
+      if (!Number.isFinite(h)) return false;
+      if (min <= max) return (h >= min && h <= max);
+      return (h >= min && h <= 360) || (h >= 0 && h <= max);
+    }
+
+    function isIOS(){
+      const ua = navigator.userAgent || "";
+      return /iPhone|iPad|iPod/i.test(ua) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+    }
+
+    function stamp(){
+      return new Date().toISOString().replace(/[:.]/g,"-");
+    }
+
+    /* ---------------------------- DOM refs ---------------------------- */
+    const app = $("app");
+
+    const stageWrap = $("stageWrap");
+    const stage = $("stage");
+    const vid = $("vid");
+    const roi = $("roi");
+    const roiCap = $("roiCap");
+    const qualDot = $("qualDot");
+
+    const camDot = $("camDot");
+    const camStatus = $("camStatus");
+    const fpsDot = $("fpsDot");
+    const fpsRead = $("fpsRead");
+
+    const landSplit = $("landSplit");
+    const landCtrl = $("landCtrl");
+    const vidLand = $("vidLand");
+    const roiL = $("roiL");
+    const roiCapL = $("roiCapL");
+    const qualDotL = $("qualDotL");
+
+    const camDotL = $("camDotL");
+    const camStatusL = $("camStatusL");
+    const fpsDotL = $("fpsDotL");
+    const fpsReadL = $("fpsReadL");
+
+    const sheet = $("sheet");
+    const sheetGrab = $("sheetGrab");
+    const sheetContent = $("sheetContent");
+    const sheetTitle = $("sheetTitle");
+    const btnSnap = $("btnSnap");
+
+    const tabScan = $("tabScan");
+    const tabTrigger = $("tabTrigger");
+    const tabPalette = $("tabPalette");
+    const tabExport = $("tabExport");
+
+    const toastEl = $("toast");
+
+    const helpModal = $("helpModal");
+    const btnHelp = $("btnHelp");
+    const btnHelpClose = $("btnHelpClose");
+
+    const roiModal = $("roiModal");
+    const btnRoiClose = $("btnRoiClose");
+    const roiPresetList = $("roiPresetList");
+    const roiPresetName = $("roiPresetName");
+    const btnRoiLoad = $("btnRoiLoad");
+    const btnRoiDelete = $("btnRoiDelete");
+    const btnRoiSave = $("btnRoiSave");
+    const btnRoiOverwrite = $("btnRoiOverwrite");
+    const btnRoiReset = $("btnRoiReset");
+    const roiCamKeyRead = $("roiCamKeyRead");
+
+    const exportFallbackModal = $("exportFallbackModal");
+    const btnExpFbClose = $("btnExpFbClose");
+    const exportFallbackText = $("exportFallbackText");
+    const btnExpFbCopy = $("btnExpFbCopy");
+    const btnExpFbSelect = $("btnExpFbSelect");
+    const exportFallbackMeta = $("exportFallbackMeta");
+
+    function setDot(el, state){
+      el.classList.remove("good","bad","warn");
+      el.classList.add(state);
+    }
+
+    function toast(msg){
+      toastEl.textContent = msg;
+      toastEl.classList.add("on");
+      clearTimeout(toastEl._t);
+      toastEl._t = setTimeout(()=>toastEl.classList.remove("on"), 1700);
+    }
+
+    function elFromHTML(html){
+      const t = document.createElement("template");
+      t.innerHTML = html.trim();
+      return t.content.firstElementChild;
+    }
+
+    /* ---------------------------- Focus trap for modals ---------------------------- */
+    let lastFocus = null;
+    function focusableIn(root){
+      return Array.from(root.querySelectorAll(
+        'button,[href],input,select,textarea,[tabindex]:not([tabindex="-1"])'
+      )).filter(el => !el.hasAttribute("disabled") && !el.getAttribute("aria-hidden"));
+    }
+    function openModal(modalEl){
+      lastFocus = document.activeElement;
+      modalEl.classList.add("on");
+      const f = focusableIn(modalEl);
+      (f[0] || modalEl).focus?.();
+    }
+    function closeModal(modalEl){
+      modalEl.classList.remove("on");
+      if (lastFocus && lastFocus.focus) lastFocus.focus();
+      lastFocus = null;
+    }
+    function trapKeydown(modalEl, ev){
+      if (!modalEl.classList.contains("on")) return;
+      if (ev.key === "Escape"){
+        ev.preventDefault();
+        closeModal(modalEl);
+        return;
+      }
+      if (ev.key !== "Tab") return;
+      const f = focusableIn(modalEl);
+      if (!f.length) return;
+      const first = f[0], last = f[f.length - 1];
+      const active = document.activeElement;
+      if (ev.shiftKey && active === first){
+        ev.preventDefault(); last.focus();
+      } else if (!ev.shiftKey && active === last){
+        ev.preventDefault(); first.focus();
+      }
+    }
+
+    document.addEventListener("keydown", (ev)=>{
+      if (helpModal.classList.contains("on")) trapKeydown(helpModal, ev);
+      if (roiModal.classList.contains("on")) trapKeydown(roiModal, ev);
+      if (exportFallbackModal.classList.contains("on")) trapKeydown(exportFallbackModal, ev);
+    }, {passive:false});
+
+    /* ---------------------------- Diagnostics / error ring ---------------------------- */
+    const DIAG_MAX = 80;
+    const diag = {
+      errors: [],
+      counters: {
+        raf: 0,
+        sample: 0,
+        sampleDrops: 0,
+        sampleFail: 0,
+        trigger: 0,
+        camRestarts: 0,
+        camStarts: 0,
+        camStops: 0
+      },
+      lastCam: {
+        attempts: [],
+        chosen: null,
+        lastSettings: null,
+        lastError: null
+      }
+    };
+
+    function diagErr(where, err, extra){
+      const msg = String(err && err.message ? err.message : err);
+      diag.errors.push({
+        t: nowISO(),
+        where,
+        msg,
+        extra: extra || null
+      });
+      if (diag.errors.length > DIAG_MAX) diag.errors.shift();
+    }
+
+    window.addEventListener("error", (e)=>{
+      diagErr("window.onerror", e.error || e.message || "error", {src:e.filename, line:e.lineno, col:e.colno});
+    });
+    window.addEventListener("unhandledrejection", (e)=>{
+      diagErr("unhandledrejection", e.reason || "rejection", null);
+    });
+
+    /* ---------------------------- State / storage (schema v4) ---------------------------- */
+    const DEFAULTS = {
+      ver: APP.schema,
+      tab: "scan",
+
+      // Camera
+      preferredDeviceId: "",
+      preferredFacing: "environment",
+      tryLock: false,
+
+      // ROI
+      roiLocked: false,
+      roiCenterLock: false,
+      roiPresets: {},      // {deviceKey: {presetName: {unit:"contentPct", l,t,w,h}}}
+      roiPresetSel: {},    // {deviceKey: presetName}
+
+      // Sampling/governor
+      maxHz: 30,
+      govEnabled: true,
+      safeMode: false,
+
+      // Trigger
+      armed: false,
+      mode: "inside",
+      hueMode: "minmax",     // "minmax" | "center"
+      hMin: 0,
+      hMax: 360,
+      hCenter: 0,
+      hWidth: 60,
+      sMin: 0.15,
+      vMin: 0.12,
+      debounceMs: 350,
+      holdMs: 0,
+      cooldownMs: 0,
+
+      // Palette
+      palAutoAdd: true,
+      palStep: 12,
+      palMax: 240,
+      palGateSV: true,
+      palSort: "count",
+      palSearch: "",
+      palGroup: "off",
+
+      // Haptics/sound
+      haptics: false,
+      sound: false,
+
+      // Reference correction
+      ref: { enabled:false, type:"", gainR:1, gainG:1, gainB:1 },
+
+      // Sets
+      sets: {
+        active: "Default",
+        items: { "Default": [] }
+      },
+
+      // Export
+      exportSelectedOnly: false
+    };
+
+    let S = loadState();
+
+    function loadState(){
+      const raw = localStorage.getItem(APP.keyState);
+      const obj = raw ? safeJsonParse(raw, null) : null;
+
+      // Migrate from older v3 key if present
+      if (!obj){
+        const legacy = localStorage.getItem("cc_trigger_palette_v3");
+        const legacyObj = legacy ? safeJsonParse(legacy, null) : null;
+        if (legacyObj && legacyObj.ver === 3){
+          const migrated = deepMerge(structuredClone(DEFAULTS), legacyObj);
+          migrated.ver = APP.schema;
+          // legacy ROI presets were video-percent; keep unit missing => treated as legacy and converted on first apply.
+          try{ localStorage.setItem(APP.keyState, JSON.stringify(migrated)); }catch(_){}
+          return migrated;
+        }
+        return structuredClone(DEFAULTS);
+      }
+
+      if (obj.ver !== APP.schema){
+        const merged = deepMerge(structuredClone(DEFAULTS), obj);
+        merged.ver = APP.schema;
+        try{ localStorage.setItem(APP.keyState, JSON.stringify(merged)); }catch(_){}
+        return merged;
+      }
+
+      return deepMerge(structuredClone(DEFAULTS), obj);
+    }
+
+    function saveState(){
+      try{
+        localStorage.setItem(APP.keyState, JSON.stringify(S));
+      }catch(e){
+        diagErr("saveState", e, null);
+      }
+    }
+
+    function ensureSets(){
+      if (!S.sets || !S.sets.items){
+        S.sets = structuredClone(DEFAULTS.sets);
+      }
+      if (!S.sets.items["Default"]) S.sets.items["Default"] = [];
+      if (!S.sets.active || !S.sets.items[S.sets.active]) S.sets.active = "Default";
+      for (const k in S.sets.items){
+        if (!Array.isArray(S.sets.items[k])) S.sets.items[k] = [];
+        if (S.sets.items[k].length > 3000) S.sets.items[k] = S.sets.items[k].slice(0, 3000);
+      }
+      saveState();
+    }
+
+    ensureSets();
+
+    /* ---------------------------- Session + history (bounded) ---------------------------- */
+    const SESSION_MAX_ROWS = 12000;
+    const SESSION_MAX_EVENTS = 2000;
+    let sessionStart = 0;
+
+    const sessRows = [];   // {t, r,g,b,h,s,v, cond, ev, conf}
+    const sessEvents = []; // {t, type, data}
+
+    function recEvent(type, data){
+      const t = Math.round(performance.now() - sessionStart);
+      sessEvents.push({t, type, data: data || null});
+      if (sessEvents.length > SESSION_MAX_EVENTS) sessEvents.shift();
+    }
+
+    const HISTORY_SECONDS = 60;
+    const HISTORY_MAX = 60 * 60;
+    const hist = {
+      t: new Float32Array(HISTORY_MAX),
+      r: new Uint16Array(HISTORY_MAX),
+      g: new Uint16Array(HISTORY_MAX),
+      b: new Uint16Array(HISTORY_MAX),
+      h: new Float32Array(HISTORY_MAX),
+      s: new Float32Array(HISTORY_MAX),
+      v: new Float32Array(HISTORY_MAX),
+      cond: new Uint8Array(HISTORY_MAX),
+      conf: new Float32Array(HISTORY_MAX),
+      n: 0,
+      i: 0
+    };
+
+    function histPush(sample){
+      const idx = hist.i;
+      hist.t[idx] = sample.t;
+      hist.r[idx] = sample.r;
+      hist.g[idx] = sample.g;
+      hist.b[idx] = sample.b;
+      hist.h[idx] = sample.h;
+      hist.s[idx] = sample.s;
+      hist.v[idx] = sample.v;
+      hist.cond[idx] = sample.cond ? 1 : 0;
+      hist.conf[idx] = sample.conf || 0;
+
+      hist.i = (hist.i + 1) % HISTORY_MAX;
+      hist.n = Math.min(HISTORY_MAX, hist.n + 1);
+    }
+
+    function histGetAtSecondsAgo(secAgo){
+      secAgo = clamp(secAgo, 0, HISTORY_SECONDS);
+      if (hist.n === 0) return null;
+      const nowT = Math.round(performance.now() - sessionStart);
+      const target = nowT - Math.round(secAgo * 1000);
+
+      let best = null;
+      for (let k=0; k<hist.n; k++){
+        const idx = (hist.i - 1 - k + HISTORY_MAX) % HISTORY_MAX;
+        const t = hist.t[idx];
+        if (!t) continue;
+        if (t <= target){
+          best = {
+            t,
+            r: hist.r[idx], g: hist.g[idx], b: hist.b[idx],
+            h: hist.h[idx], s: hist.s[idx], v: hist.v[idx],
+            cond: !!hist.cond[idx],
+            conf: hist.conf[idx] || 0
+          };
+          break;
+        }
+      }
+      return best;
+    }
+
+    /* ---------------------------- Palette store (persisted) ---------------------------- */
+    // key -> {key, r,g,b,h,s,v, hex, count, firstT, lastT, pinned}
+    const palMap = new Map();
+    let palDirty = false;
+    let palSaveT = 0;
+    let palSelMode = false;
+    const palSelected = new Set();
+    let clusterMode = false;
+    let clusters = null;
+
+    function quantKey(r,g,b, step){
+      const q = (x)=> Math.round(x/step)*step;
+      const rq = clamp(q(r),0,255)|0;
+      const gq = clamp(q(g),0,255)|0;
+      const bq = clamp(q(b),0,255)|0;
+      return `${rq},${gq},${bq}`;
+    }
+
+    function paletteLoad(){
+      const raw = localStorage.getItem(APP.keyPalette);
+      if (!raw) return;
+      const obj = safeJsonParse(raw, null);
+      if (!obj || obj.ver !== APP.schema || !Array.isArray(obj.items)) return;
+
+      palMap.clear();
+      for (const it of obj.items){
+        if (!it || typeof it.key !== "string") continue;
+        const r = intClamp(it.r,0,255), g = intClamp(it.g,0,255), b = intClamp(it.b,0,255);
+        const hsv = rgbToHsv(r,g,b);
+        palMap.set(it.key, {
+          key: it.key,
+          r,g,b,
+          h: Number.isFinite(it.h) ? it.h : hsv.h,
+          s: Number.isFinite(it.s) ? it.s : hsv.s,
+          v: Number.isFinite(it.v) ? it.v : hsv.v,
+          hex: rgbToHex(r,g,b),
+          count: intClamp(it.count ?? 1, 1, 1e9),
+          firstT: intClamp(it.firstT ?? 0, 0, 1e9),
+          lastT: intClamp(it.lastT ?? 0, 0, 1e9),
+          pinned: !!it.pinned
+        });
+      }
+    }
+
+    function paletteScheduleSave(){
+      palDirty = true;
+      palSaveT = performance.now();
+    }
+
+    function paletteFlushSave(force=false){
+      if (!palDirty) return;
+      const now = performance.now();
+      if (!force && (now - palSaveT) < 900) return;
+
+      // Compact payload
+      const items = [];
+      for (const it of palMap.values()){
+        items.push({
+          key: it.key,
+          r: it.r, g: it.g, b: it.b,
+          h: it.h, s: it.s, v: it.v,
+          count: it.count,
+          firstT: it.firstT,
+          lastT: it.lastT,
+          pinned: it.pinned ? 1 : 0
+        });
+      }
+      const payload = {
+        ver: APP.schema,
+        saved_at: nowISO(),
+        items
+      };
+      try{
+        localStorage.setItem(APP.keyPalette, JSON.stringify(payload));
+      }catch(e){
+        diagErr("paletteSave", e, {items: items.length});
+      }
+      palDirty = false;
+    }
+
+    function paletteMaybeAdd(sample, force=false){
+      if (!sample) return;
+      if (!camera.on) return;
+
+      const step = intClamp(ui.palStep?.value ?? S.palStep, 1, 64);
+      const maxN = intClamp(ui.palMax?.value ?? S.palMax, 10, 2000);
+
+      if (!force && S.palGateSV){
+        if (!(sample.s >= S.sMin && sample.v >= S.vMin)) return;
+      }
+      if (!force && !S.palAutoAdd) return;
+
+      const key = quantKey(sample.r, sample.g, sample.b, step);
+
+      if (palMap.has(key)){
+        const it = palMap.get(key);
+        it.count++;
+        it.lastT = sample.t;
+        it.r = sample.r; it.g = sample.g; it.b = sample.b;
+        it.h = sample.h; it.s = sample.s; it.v = sample.v;
+        it.hex = rgbToHex(sample.r, sample.g, sample.b);
+        paletteScheduleSave();
+        return;
+      }
+
+      palMap.set(key, {
+        key,
+        r: sample.r, g: sample.g, b: sample.b,
+        h: sample.h, s: sample.s, v: sample.v,
+        hex: rgbToHex(sample.r, sample.g, sample.b),
+        count: 1,
+        firstT: sample.t,
+        lastT: sample.t,
+        pinned: false
+      });
+
+      // Eviction: least valuable = low count + old
+      if (palMap.size > maxN){
+        const nowT = sample.t;
+        let victimKey = null;
+        let victimValue = Infinity;
+
+        for (const [k,v] of palMap.entries()){
+          if (v.pinned) continue;
+
+          const age = Math.max(0, nowT - (v.lastT || 0));
+          const recency = 1 / (1 + age / 6000); // 0..1 (fast decay)
+          const freq = Math.log1p(v.count || 1); // diminishing returns
+          // lower is worse; we minimize "worse score"
+          const worse = (1.0 / (freq + 0.001)) * 0.7 + (1.0 - recency) * 0.3;
+
+          if (worse < victimValue){
+            victimValue = worse;
+            victimKey = k;
+          }
+        }
+
+        if (victimKey){
+          palMap.delete(victimKey);
+          palSelected.delete(victimKey);
+          for (const setName in S.sets.items){
+            const arr = S.sets.items[setName];
+            S.sets.items[setName] = arr.filter(x=>x !== victimKey);
+          }
+          recEvent("palette_evict", {key: victimKey});
+          saveState();
+        }
+      }
+
+      paletteScheduleSave();
+      recEvent("palette_add", {key});
+    }
+
+    function paletteClear(){
+      palMap.clear();
+      palSelected.clear();
+      clusters = null;
+      paletteScheduleSave();
+      recEvent("palette_clear", {});
+    }
+
+    function paletteExportList(sorted=true){
+      const arr = Array.from(palMap.values());
+      if (!sorted) return arr;
+
+      const mode = S.palSort;
+      arr.sort((a,b)=>{
+        if (mode === "pinned"){
+          if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
+          if (b.count !== a.count) return b.count - a.count;
+          return b.lastT - a.lastT;
+        }
+        if (mode === "count"){
+          if (b.count !== a.count) return b.count - a.count;
+          return b.lastT - a.lastT;
+        }
+        if (mode === "recent") return b.lastT - a.lastT;
+        if (mode === "hue"){
+          if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
+          return (a.h||0) - (b.h||0);
+        }
+        return 0;
+      });
+      return arr;
+    }
+
+    function paletteExportHexText(keys=null){
+      const arr = keys ? keys.map(k=>palMap.get(k)).filter(Boolean) : paletteExportList(true);
+      return arr.map(x=>x.hex).join("\n");
+    }
+
+    function paletteExportCssVars(keys=null){
+      const arr = keys ? keys.map(k=>palMap.get(k)).filter(Boolean) : paletteExportList(true);
+      let i = 1;
+      const lines = [":root{"];
+      for (const it of arr){
+        const n = String(i).padStart(2,"0");
+        const name = it.pinned ? `--pin-${n}` : `--c-${n}`;
+        lines.push(`  ${name}: ${it.hex}; /* seen ${it.count}x, H ${fmt(it.h,1)} */`);
+        i++;
+      }
+      lines.push("}");
+      return lines.join("\n");
+    }
+
+    function csvEscape(s){
+      const t = String(s ?? "");
+      if (/[",\n]/.test(t)) return `"${t.replace(/"/g,'""')}"`;
+      return t;
+    }
+
+    function paletteCSV(keys=null){
+      const header = ["key","hex","r","g","b","hue_deg","sat","val","count","first_ms","last_ms","pinned"];
+      const lines = [header.join(",")];
+      const arr = keys ? keys.map(k=>palMap.get(k)).filter(Boolean) : Array.from(palMap.values());
+      for (const it of arr){
+        lines.push([
+          it.key, it.hex, it.r, it.g, it.b,
+          fmt(it.h,2), fmt(it.s,4), fmt(it.v,4),
+          it.count, it.firstT, it.lastT, it.pinned ? 1 : 0
+        ].map(csvEscape).join(","));
+      }
+      return lines.join("\n");
+    }
+
+    function paletteJSON(keys=null){
+      const arr = keys ? keys.map(k=>palMap.get(k)).filter(Boolean) : Array.from(palMap.values());
+      return JSON.stringify({
+        exported_at: nowISO(),
+        app: APP.name,
+        build: APP.build,
+        schema: APP.schema,
+        quant_step: S.palStep,
+        max_palette: S.palMax,
+        items: arr,
+        sets: S.sets
+      }, null, 2);
+    }
+
+    function sessionCSV(){
+      const header = ["t_ms","r","g","b","hue_deg","sat","val","cond","conf","event"];
+      const lines = [header.join(",")];
+      for (const r of sessRows){
+        lines.push([
+          r.t, r.r, r.g, r.b,
+          fmt(r.h,2), fmt(r.s,4), fmt(r.v,4),
+          r.cond ? 1 : 0,
+          fmt(r.conf ?? 0, 3),
+          r.ev || ""
+        ].map(csvEscape).join(","));
+      }
+      return lines.join("\n");
+    }
+
+    function sessionJSON(){
+      return JSON.stringify({
+        exported_at: nowISO(),
+        app: APP.name,
+        build: APP.build,
+        schema: APP.schema,
+        settings: S,
+        palette_count: palMap.size,
+        events: sessEvents,
+        rows: sessRows
+      }, null, 2);
+    }
+
+    /* ---------------------------- Export fallback (iOS-safe) ---------------------------- */
+    async function copyText(text){
+      try{
+        await navigator.clipboard.writeText(text);
+        toast("Copied");
+        return true;
+      }catch(e){
+        // fallback
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        ta.style.position = "fixed";
+        ta.style.left = "-9999px";
+        document.body.appendChild(ta);
+        ta.focus();
+        ta.select();
+        let ok = false;
+        try{ ok = document.execCommand("copy"); }catch(_){}
+        ta.remove();
+        toast(ok ? "Copied (fallback)" : "Copy failed");
+        return ok;
+      }
+    }
+
+    function openExportFallback(name, mime, text){
+      exportFallbackText.value = text;
+      exportFallbackMeta.textContent = `${name} · ${mime} · ${Math.round(text.length/1024)} KB`;
+      openModal(exportFallbackModal);
+      // select text for quick manual copy on iOS
+      setTimeout(()=>{ exportFallbackText.focus(); exportFallbackText.setSelectionRange(0,0); }, 0);
+    }
+
+    function downloadTextReliable(name, text, mime="text/plain"){
+      // Strategy:
+      // 1) Attempt Blob URL + anchor click (best for most browsers)
+      // 2) On iOS (or if click fails), immediately show fallback modal with copy option
+      // Note: we cannot reliably detect "download failed" after the click, so we proactively provide fallback for iOS.
+      let usedFallback = false;
+
+      try{
+        const blob = new Blob([text], {type:mime});
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = name;
+        a.rel = "noopener";
+        // Some iOS Safari builds require the element to be in DOM
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(()=>URL.revokeObjectURL(url), 8000);
+      }catch(e){
+        diagErr("downloadTextReliable", e, {name});
+        usedFallback = true;
+      }
+
+      if (isIOS() || usedFallback){
+        // Keep offline: show the content for copy/save
+        openExportFallback(name, mime, text);
+        toast("Download fallback opened");
+      } else {
+        toast("Download started (if blocked, use Copy)");
+      }
+    }
+
+    btnExpFbClose.addEventListener("click", ()=> closeModal(exportFallbackModal));
+    exportFallbackModal.addEventListener("click", (ev)=>{ if (ev.target === exportFallbackModal) closeModal(exportFallbackModal); });
+    btnExpFbCopy.addEventListener("click", async ()=> { await copyText(exportFallbackText.value); });
+    btnExpFbSelect.addEventListener("click", ()=>{
+      exportFallbackText.focus();
+      exportFallbackText.select();
+    });
+
+    /* ---------------------------- UI refs (populated per panel mount) ---------------------------- */
+    const ui = {};
+
+    /* ---------------------------- Panels ---------------------------- */
+    const panels = {
+      scan: elFromHTML(`
+        <div data-panel="scan">
+          <div class="card">
+            <div class="cardH"><span>Scan</span><span class="sumTag" id="scanStatTag">idle</span></div>
+            <div class="cardB">
+              <div class="row tight">
+                <button class="btn primary" id="btnStart" aria-label="Start camera">Start</button>
+                <button class="btn" id="btnStop" disabled aria-label="Stop camera">Stop</button>
+                <button class="btn" id="btnSwitch" disabled aria-label="Switch camera">Switch Camera</button>
+              </div>
+
+              <div class="row tight">
+                <button class="btn" id="btnCapture" disabled aria-label="Capture color into palette">Capture color</button>
+                <button class="btn" id="btnLockRoi" disabled aria-label="Lock ROI">Lock ROI</button>
+                <button class="btn" id="btnRoiPreset" disabled aria-label="Manage ROI presets">ROI Presets</button>
+              </div>
+
+              <div class="row tight">
+                <button class="btn" id="btnRoiCenterLock" disabled aria-label="Toggle ROI center lock">Center lock: OFF</button>
+                <button class="btn" id="btnRoiReset2" disabled aria-label="Reset ROI">Reset ROI</button>
+              </div>
+
+              <div class="row tight">
+                <span class="pill2"><span class="dot warn" id="permDot"></span><span id="permRead">permissions: —</span></span>
+                <span class="pill2"><span class="dot warn" id="govDot"></span><span id="govRead">governor: —</span></span>
+              </div>
+
+              <div class="hint" id="camHint"></div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="cardH"><span>Live sample</span><span class="sumTag" id="qualTag">quality —</span></div>
+            <div class="cardB">
+              <div class="kpi">
+                <div class="swatchBig" id="swatch"></div>
+                <div class="vals">
+                  <b id="rgbRead">RGB: —</b>
+                  <span id="hsvRead">HSV: —</span>
+                  <span id="roiRead">ROI: —</span>
+                </div>
+              </div>
+
+              <div class="row tight">
+                <div class="field" style="min-width:220px;">
+                  <label>Quality meter (sat + value + stability)</label>
+                  <div class="meter"><i id="qualBar"></i></div>
+                </div>
+                <span class="pill2"><span class="dot warn" id="flickDot"></span><span id="flickRead">flicker: —</span></span>
+              </div>
+
+              <div class="timeline">
+                <canvas id="tlCanvas" width="900" height="140"></canvas>
+                <div class="tlRow">
+                  <div class="field" style="min-width:220px;">
+                    <label>History scrub (last 60s)</label>
+                    <input id="tlScrub" type="range" min="0" max="60" step="0.25" value="0" aria-label="Timeline scrub seconds ago"/>
+                  </div>
+                  <span class="pill2"><span id="tlPickRead">pick: —</span></span>
+                  <button class="btn" id="btnAddPick" disabled aria-label="Add picked color to palette">Add picked</button>
+                </div>
+              </div>
+
+              <div class="card" style="background:rgba(255,255,255,.03); border-color:rgba(255,255,255,.10);">
+                <div class="cardH"><span>Reference correction</span><span class="sumTag" id="refTag">off</span></div>
+                <div class="cardB">
+                  <div class="row tight">
+                    <button class="btn" id="btnRefWhite" disabled aria-label="Capture white reference">Capture WHITE</button>
+                    <button class="btn" id="btnRefGray" disabled aria-label="Capture gray reference">Capture GRAY</button>
+                    <button class="btn bad" id="btnRefClear" disabled aria-label="Clear reference correction">Clear</button>
+                  </div>
+                  <div class="hint">Applies a simple RGB gain correction to reduce drift. Fill ROI with a neutral target under the same lighting.</div>
+                </div>
+              </div>
+
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="cardH"><span>Quick settings</span><span class="sumTag" id="hzTag">Hz —</span></div>
+            <div class="cardB">
+              <div class="row tight">
+                <div class="field">
+                  <label>Max sampling rate (Hz)</label>
+                  <select id="selHz" aria-label="Max sampling rate">
+                    <option>60</option>
+                    <option selected>30</option>
+                    <option>20</option>
+                    <option>15</option>
+                    <option>10</option>
+                    <option>5</option>
+                  </select>
+                </div>
+                <div class="field">
+                  <label>Auto-add palette</label>
+                  <button class="btn" id="btnAutoAdd" disabled aria-label="Toggle auto add palette">Auto: ON</button>
+                </div>
+              </div>
+
+              <div class="row tight">
+                <div class="field">
+                  <label>Safe mode (lower heat)</label>
+                  <button class="btn" id="btnSafe">Safe: OFF</button>
+                </div>
+                <div class="field">
+                  <label>Governor</label>
+                  <button class="btn" id="btnGov">Gov: ON</button>
+                </div>
+              </div>
+
+              <div class="row tight">
+                <div class="field">
+                  <label>Haptics</label>
+                  <button class="btn" id="btnHaptic">Haptics: OFF</button>
+                </div>
+                <div class="field">
+                  <label>Sound cue</label>
+                  <button class="btn" id="btnSound">Sound: OFF</button>
+                </div>
+              </div>
+
+              <div class="hint">Governor may reduce actual Hz to keep preview smooth. Safe mode further reduces pixel reads to avoid thermal throttling.</div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="cardH"><span>Diagnostics</span><span class="sumTag" id="diagTag">—</span></div>
+            <div class="cardB">
+              <div class="row tight">
+                <span class="pill2"><span id="diagReadA">—</span></span>
+              </div>
+              <div class="row tight">
+                <span class="pill2"><span id="diagReadB">—</span></span>
+              </div>
+              <div class="hint" id="diagErrs" style="white-space:pre-wrap;"></div>
+              <div class="row tight">
+                <button class="btn" id="btnCopyDiag" aria-label="Copy diagnostics">Copy diag</button>
+                <button class="btn bad" id="btnClearErr" aria-label="Clear errors">Clear errors</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="cardH"><span>Event log</span><span class="sumTag" id="evTag">0</span></div>
+            <div class="cardB">
+              <div class="log" id="log" aria-label="Event log"></div>
+              <div class="row tight">
+                <button class="btn" id="btnMark" disabled aria-label="Add manual mark">Mark</button>
+                <button class="btn bad" id="btnClearLog" disabled aria-label="Clear session log">Clear</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      `),
+
+      trigger: elFromHTML(`
+        <div data-panel="trigger">
+          <div class="card">
+            <div class="cardH"><span>Trigger</span><span class="sumTag" id="trigTag">idle</span></div>
+            <div class="cardB">
+              <div class="row tight">
+                <button class="btn good" id="btnArm" disabled aria-label="Arm trigger">Armed: OFF</button>
+                <span class="pill2"><span class="dot warn" id="trigDot"></span><span id="trigRead">trigger: idle</span></span>
+                <span class="pill2"><span class="dot warn" id="condDot"></span><span id="condRead">cond: —</span></span>
+              </div>
+
+              <div class="strip" id="condStrip" aria-label="Trigger condition history"></div>
+              <div class="hint" id="confRead">confidence: —</div>
+
+              <div class="card" style="background:rgba(255,255,255,.03); border-color:rgba(255,255,255,.10);">
+                <div class="cardH"><span>Hue selection</span><span class="sumTag" id="wrapTag">—</span></div>
+                <div class="cardB">
+                  <div class="row tight">
+                    <div class="field">
+                      <label>Hue mode</label>
+                      <select id="hueMode" aria-label="Hue mode">
+                        <option value="minmax" selected>Min/Max</option>
+                        <option value="center">Center + Width</option>
+                      </select>
+                    </div>
+                    <div class="field">
+                      <label>Inside/Outside</label>
+                      <select id="mode" aria-label="Inside or outside range">
+                        <option value="inside" selected>Inside range</option>
+                        <option value="outside">Outside range</option>
+                      </select>
+                    </div>
+                  </div>
+
+                  <div class="hueBar" id="hueBar" aria-hidden="true">
+                    <div class="hueMask"></div>
+                    <div class="hueSel" id="hueSelA" style="left:0; width:0;"></div>
+                    <div class="hueSel" id="hueSelB" style="left:0; width:0;"></div>
+                    <div class="hueEdge left">0°</div>
+                    <div class="hueEdge right">360°</div>
+                  </div>
+
+                  <div class="row tight" id="minmaxRow">
+                    <div class="field">
+                      <label>Hue min (°)</label>
+                      <input id="hMin" type="range" min="0" max="360" step="1" value="0" aria-label="Hue minimum"/>
+                      <span class="pill2">min <b id="hMinRead" style="color:var(--ink)">0</b></span>
+                    </div>
+                    <div class="field">
+                      <label>Hue max (°)</label>
+                      <input id="hMax" type="range" min="0" max="360" step="1" value="360" aria-label="Hue maximum"/>
+                      <span class="pill2">max <b id="hMaxRead" style="color:var(--ink)">360</b></span>
+                    </div>
+                  </div>
+
+                  <div class="row tight" id="centerRow" style="display:none;">
+                    <div class="field">
+                      <label>Hue center (°)</label>
+                      <input id="hCenter" type="range" min="0" max="360" step="1" value="0" aria-label="Hue center"/>
+                      <span class="pill2">center <b id="hCenterRead" style="color:var(--ink)">0</b></span>
+                    </div>
+                    <div class="field">
+                      <label>Hue width (°)</label>
+                      <input id="hWidth" type="range" min="0" max="360" step="1" value="60" aria-label="Hue width"/>
+                      <span class="pill2">width <b id="hWidthRead" style="color:var(--ink)">60</b></span>
+                    </div>
+                  </div>
+
+                  <div class="row tight">
+                    <span class="wrapBadge"><span class="dot warn" id="wrapDot"></span><span id="wrapRead">wrap: —</span></span>
+                  </div>
+                </div>
+              </div>
+
+              <div class="card" style="background:rgba(255,255,255,.03); border-color:rgba(255,255,255,.10);">
+                <div class="cardH"><span>Thresholds + timing</span><span class="sumTag" id="timTag">—</span></div>
+                <div class="cardB">
+                  <div class="row tight">
+                    <div class="field">
+                      <label>Min saturation (0–1)</label>
+                      <input id="sMin" type="number" min="0" max="1" step="0.01" value="0.15" aria-label="Minimum saturation"/>
+                    </div>
+                    <div class="field">
+                      <label>Min value/brightness (0–1)</label>
+                      <input id="vMin" type="number" min="0" max="1" step="0.01" value="0.12" aria-label="Minimum value"/>
+                    </div>
+                  </div>
+
+                  <div class="row tight">
+                    <div class="field">
+                      <label>Debounce (ms)</label>
+                      <input id="debounce" type="number" min="0" max="60000" step="50" value="350" aria-label="Debounce milliseconds"/>
+                    </div>
+                    <div class="field">
+                      <label>Hold time (ms)</label>
+                      <input id="hold" type="number" min="0" max="60000" step="50" value="0" aria-label="Hold milliseconds"/>
+                    </div>
+                  </div>
+
+                  <div class="row tight">
+                    <div class="field">
+                      <label>Cooldown after trigger (ms)</label>
+                      <input id="cooldown" type="number" min="0" max="60000" step="50" value="0" aria-label="Cooldown milliseconds"/>
+                    </div>
+                    <div class="field">
+                      <label>Try lock AE/AWB (best effort)</label>
+                      <button class="btn" id="btnTryLock" disabled aria-label="Toggle AE/AWB lock">Lock: OFF</button>
+                    </div>
+                  </div>
+
+                  <div class="row tight">
+                    <div class="field">
+                      <label>Preset</label>
+                      <div class="row tight">
+                        <button class="btn small" id="preLED">LED</button>
+                        <button class="btn small" id="preScreen">Screen</button>
+                        <button class="btn small" id="prePaper">Paper</button>
+                        <button class="btn small" id="preNeon">Neon</button>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div class="hint">Hold time reduces jitter near thresholds. Cooldown prevents repeated triggers on continuous TRUE conditions.</div>
+                </div>
+              </div>
+
+            </div>
+          </div>
+        </div>
+      `),
+
+      palette: elFromHTML(`
+        <div data-panel="palette">
+          <div class="card">
+            <div class="cardH"><span>Palette</span><span class="sumTag" id="palTag">0</span></div>
+            <div class="cardB">
+
+              <div class="paletteTop">
+                <div class="field" style="min-width:210px;">
+                  <label>Quantization step</label>
+                  <input id="palStep" type="range" min="1" max="32" step="1" value="12" aria-label="Palette quantization step"/>
+                  <span class="pill2">step <b id="palStepRead" style="color:var(--ink)">12</b></span>
+                </div>
+
+                <div class="field" style="min-width:190px;">
+                  <label>Max palette size</label>
+                  <input id="palMax" type="number" min="10" max="2000" step="10" value="240" aria-label="Max palette size"/>
+                </div>
+
+                <div class="field" style="min-width:200px;">
+                  <label>Sort</label>
+                  <select id="palSort" aria-label="Palette sort">
+                    <option value="count" selected>Most seen</option>
+                    <option value="recent">Most recent</option>
+                    <option value="hue">Hue</option>
+                    <option value="pinned">Pinned first</option>
+                  </select>
+                </div>
+
+                <div class="field" style="min-width:210px;">
+                  <label>Gate low S/V</label>
+                  <button class="btn" id="btnGate" aria-label="Toggle palette gate">Gate: ON</button>
+                </div>
+
+                <div class="field" style="min-width:220px;">
+                  <label>Multi-select</label>
+                  <div class="row tight">
+                    <button class="btn" id="btnSelMode" aria-label="Toggle select mode">Select: OFF</button>
+                    <button class="btn bad" id="btnPalClear" disabled aria-label="Clear palette">Clear</button>
+                  </div>
+                </div>
+              </div>
+
+              <div class="row tight">
+                <div class="field" style="min-width:220px;">
+                  <label>Search (#hex, rgb, partial)</label>
+                  <input id="palSearch" type="text" placeholder="#ff7a18 or 255,122,24" inputmode="text" aria-label="Palette search"/>
+                </div>
+                <div class="field" style="min-width:220px;">
+                  <label>Hue bucket grouping</label>
+                  <select id="palGroup" aria-label="Hue grouping">
+                    <option value="off" selected>Off</option>
+                    <option value="30">30° buckets</option>
+                    <option value="60">60° buckets</option>
+                    <option value="90">90° buckets</option>
+                  </select>
+                </div>
+              </div>
+
+              <div class="row tight">
+                <button class="btn small" id="btnCopyHex" disabled>Copy HEX list</button>
+                <button class="btn small" id="btnCopyCss" disabled>Copy CSS vars</button>
+                <button class="btn small" id="btnToSet" disabled>Move to set</button>
+                <button class="btn small bad" id="btnDelSel" disabled>Delete selected</button>
+              </div>
+
+              <div class="card" style="background:rgba(255,255,255,.03); border-color:rgba(255,255,255,.10);">
+                <div class="cardH"><span>Palette sets</span><span class="sumTag" id="setTag">—</span></div>
+                <div class="cardB">
+                  <div class="row tight">
+                    <div class="field" style="min-width:200px;">
+                      <label>Active set</label>
+                      <select id="setSel" aria-label="Active set"></select>
+                    </div>
+                    <button class="btn" id="btnSetAdd">New set</button>
+                    <button class="btn bad" id="btnSetDel">Delete set</button>
+                  </div>
+                  <div class="hint">Sets persist in localStorage. Use Multi-select → Move to set to organize.</div>
+                </div>
+              </div>
+
+              <div class="card" style="background:rgba(255,255,255,.03); border-color:rgba(255,255,255,.10);">
+                <div class="cardH"><span>Dedupe / clustering</span><span class="sumTag" id="cluTag">off</span></div>
+                <div class="cardB">
+                  <div class="row tight">
+                    <button class="btn" id="btnCluster">Cluster: OFF</button>
+                    <div class="field" style="min-width:220px;">
+                      <label>Distance threshold (perceptual-ish)</label>
+                      <input id="cluThr" type="range" min="6" max="80" step="1" value="24" aria-label="Cluster distance threshold"/>
+                      <span class="pill2">thr <b id="cluThrRead" style="color:var(--ink)">24</b></span>
+                    </div>
+                    <button class="btn" id="btnMerge" disabled>Merge clusters</button>
+                  </div>
+                  <div class="hint">On-demand. Clustering analyzes top colors by count for speed. Merge keeps the most-seen color per cluster (pinned are never deleted).</div>
+                </div>
+              </div>
+
+              <div id="clusterOut" class="hint" style="display:none;"></div>
+
+              <div class="paletteGrid" id="paletteGrid"></div>
+
+              <div class="hint">Eviction removes least valuable unpinned colors when max size is reached. Value considers both count and recency.</div>
+            </div>
+          </div>
+        </div>
+      `),
+
+      export: elFromHTML(`
+        <div data-panel="export">
+          <div class="card">
+            <div class="cardH"><span>Export</span><span class="sumTag" id="expTag">ready</span></div>
+            <div class="cardB">
+
+              <div class="row tight">
+                <span class="pill2"><span id="selRead">selected: —</span></span>
+                <button class="btn" id="btnSelOnly">Selected only: OFF</button>
+              </div>
+
+              <div class="row tight">
+                <button class="btn primary" id="btnCopyHex2" disabled>Copy HEX</button>
+                <button class="btn primary" id="btnCopyCss2" disabled>Copy CSS vars</button>
+              </div>
+
+              <div class="row tight">
+                <button class="btn" id="btnDlPalJson" disabled>Download palette JSON</button>
+                <button class="btn" id="btnDlPalCsv" disabled>Download palette CSV</button>
+              </div>
+
+              <div class="row tight">
+                <button class="btn" id="btnDlSessJson" disabled>Download session JSON</button>
+                <button class="btn" id="btnDlSessCsv" disabled>Download session CSV</button>
+              </div>
+
+              <div class="card" style="background:rgba(255,255,255,.03); border-color:rgba(255,255,255,.10);">
+                <div class="cardH"><span>Web Share</span><span class="sumTag" id="shareTag">—</span></div>
+                <div class="cardB">
+                  <div class="row tight">
+                    <button class="btn" id="btnShareText" disabled>Share text</button>
+                    <button class="btn" id="btnShareFiles" disabled>Share files</button>
+                  </div>
+                  <div class="hint">If file sharing isn’t supported, use downloads + clipboard fallback.</div>
+                </div>
+              </div>
+
+              <div class="card" style="background:rgba(255,255,255,.03); border-color:rgba(255,255,255,.10);">
+                <div class="cardH"><span>Export bundle</span><span class="sumTag">manifest + downloads</span></div>
+                <div class="cardB">
+                  <button class="btn" id="btnBundle" disabled>Export bundle</button>
+                  <div class="hint">Creates manifest.json plus separate downloads (no zip dependency). Manifest includes device info, last camera settings, and a settings snapshot.</div>
+                </div>
+              </div>
+
+              <div class="card">
+                <div class="cardH"><span>System</span><span class="sumTag" id="sysTag">—</span></div>
+                <div class="cardB">
+                  <div class="row tight">
+                    <span class="pill2"><span id="sysRead">—</span></span>
+                  </div>
+                  <div class="row tight">
+                    <button class="btn bad" id="btnReset">Reset all data</button>
+                  </div>
+                  <div class="hint">Reset clears localStorage keys used by this app (settings + palette + sets). Session is memory-only and clears on reload.</div>
+                </div>
+              </div>
+
+            </div>
+          </div>
+        </div>
+      `)
+    };
+
+    /* ---------------------------- Tabs / layout ---------------------------- */
+    function isLandscape(){
+      return window.matchMedia && window.matchMedia("(orientation: landscape) and (min-width: 720px)").matches;
+    }
+    function activeContainer(){
+      return isLandscape() ? landCtrl : sheetContent;
+    }
+    function setTab(which){
+      S.tab = which;
+      saveState();
+
+      const map = {scan:tabScan, trigger:tabTrigger, palette:tabPalette, export:tabExport};
+      for (const k in map){
+        const btn = map[k];
+        const on = (k === which);
+        btn.classList.toggle("on", on);
+        btn.setAttribute("aria-pressed", on ? "true" : "false");
+      }
+      const titleMap = {scan:"Scan", trigger:"Trigger", palette:"Palette", export:"Export"};
+      sheetTitle.setAttribute("aria-label", `Panel: ${titleMap[which] || which}`);
+
+      const target = activeContainer();
+      target.innerHTML = "";
+      target.appendChild(panels[which]);
+
+      bindUIRefs(which);
+      refreshButtons(true);
+    }
+
+    tabScan.addEventListener("click", ()=> setTab("scan"));
+    tabTrigger.addEventListener("click", ()=> setTab("trigger"));
+    tabPalette.addEventListener("click", ()=> setTab("palette"));
+    tabExport.addEventListener("click", ()=> setTab("export"));
+
+    window.addEventListener("resize", ()=>{
+      // Remount current panel to the proper container on layout change
+      setTab(S.tab || "scan");
+      // Keep ROI locked to visible content rect after resize/orientation
+      requestAnimationFrame(()=>{ roiApplyStoredSelection(); });
+    });
+
+    /* ---------------------------- Help ---------------------------- */
+    btnHelp.addEventListener("click", ()=> openModal(helpModal));
+    btnHelpClose.addEventListener("click", ()=> closeModal(helpModal));
+    helpModal.addEventListener("click", (ev)=>{ if (ev.target === helpModal) closeModal(helpModal); });
+
+    /* ---------------------------- ROI presets modal ---------------------------- */
+    btnRoiClose.addEventListener("click", ()=> closeModal(roiModal));
+    roiModal.addEventListener("click", (ev)=>{ if (ev.target === roiModal) closeModal(roiModal); });
+
+    /* ---------------------------- Camera + sampling ---------------------------- */
+    const camera = {
+      on: false,
+      stream: null,
+      devices: [],
+      deviceId: "",
+      usingFacing: "environment",
+
+      // sampling timing
+      maxHz: 30,
+      actualHz: 30,
+      nextSampleAt: 0,
+      lastSampleAt: 0,
+      sampleIntervalMs: 0,
+      sampleCostEMA: 0,
+
+      // fps
+      lastRaf: 0,
+      fpsEMA: 0,
+
+      // trigger
+      armed: false,
+      lastStable: false,
+      rawTrueSince: 0,
+      lastFireAt: -Infinity,
+
+      // audio
+      audioCtx: null,
+
+      // reference correction
+      ref: { enabled:false, gainR:1, gainG:1, gainB:1, type:"" },
+
+      // status
+      wanted: false
+    };
+
+    // sampling canvas (reuse; avoid resizing unless needed)
+    const sampC = document.createElement("canvas");
+    const sampX = sampC.getContext("2d", { willReadFrequently: true });
+    let sampW = 0, sampH = 0;
+
+    // UI update throttle
+    let uiLastUpdate = 0;
+    let roiCapLast = "";
+
+    function setCameraStatus(ok, msg){
+      const dot = ok ? "good" : (msg.includes("idle") ? "warn" : "bad");
+      camStatus.textContent = msg;
+      camStatusL.textContent = msg;
+      setDot(camDot, dot);
+      setDot(camDotL, dot);
+    }
+
+    function setFps(fps){
+      const s = Number.isFinite(fps) ? `fps: ${fmt(fps,1)}` : "fps: —";
+      fpsRead.textContent = s;
+      fpsReadL.textContent = s;
+      const st = (fps >= 24) ? "good" : (fps >= 12 ? "warn" : "bad");
+      setDot(fpsDot, st);
+      setDot(fpsDotL, st);
+    }
+
+    function setQualDot(q){
+      const st = (q >= 0.70) ? "good" : (q >= 0.40 ? "warn" : "bad");
+      qualDot.style.background = st === "good" ? "var(--good)" : (st === "warn" ? "var(--warn)" : "var(--bad)");
+      qualDotL.style.background = qualDot.style.background;
+    }
+
+    function stopTracks(){
+      if (camera.stream){
+        try{
+          for (const t of camera.stream.getTracks()){
+            try{ t.onended = null; }catch(_){}
+            t.stop();
+          }
+        }catch(_){}
+      }
+      camera.stream = null;
+      camera.on = false;
+      camera.deviceId = "";
+    }
+
+    async function enumerateDevices(){
+      if (!navigator.mediaDevices?.enumerateDevices) return [];
+      try{
+        const ds = await navigator.mediaDevices.enumerateDevices();
+        return ds.filter(d=>d.kind === "videoinput");
+      }catch(e){
+        diagErr("enumerateDevices", e, null);
+        return [];
+      }
+    }
+
+    async function applyBestEffortLocks(track){
+      if (!track || typeof track.applyConstraints !== "function") return;
+      if (!S.tryLock) return;
+
+      const attempts = [
+        { advanced: [{ exposureMode: "manual" }] },
+        { advanced: [{ whiteBalanceMode: "manual" }] },
+        { advanced: [{ exposureCompensation: 0 }] },
+        { advanced: [{ focusMode: "continuous" }] }
+      ];
+      for (const a of attempts){
+        try{ await track.applyConstraints(a); }catch(_){}
+      }
+    }
+
+    function attachTrackHandlers(track){
+      if (!track) return;
+      try{
+        track.onended = ()=>{
+          diag.counters.camStops++;
+          diagErr("track.onended", "Video track ended", track.getSettings ? track.getSettings() : null);
+          recEvent("camera_track_ended", {});
+          setCameraStatus(false, "camera: ended");
+          stopCamera(/*keepWanted*/true);
+        };
+      }catch(_){}
+    }
+
+    function setRoiLocked(locked){
+      S.roiLocked = !!locked;
+      roi.classList.toggle("locked", S.roiLocked);
+      roiL.classList.toggle("locked", S.roiLocked);
+      saveState();
+      if (ui.btnLockRoi){
+        ui.btnLockRoi.textContent = S.roiLocked ? "Lock ROI: ON" : "Lock ROI";
+      }
+    }
+
+    function setRoiCenterLock(on){
+      S.roiCenterLock = !!on;
+      saveState();
+      if (ui.btnRoiCenterLock){
+        ui.btnRoiCenterLock.textContent = `Center lock: ${S.roiCenterLock ? "ON" : "OFF"}`;
+      }
+    }
+
+    function wireEnabled(on){
+      if (ui.btnStop) ui.btnStop.disabled = !on;
+      if (ui.btnSwitch) ui.btnSwitch.disabled = !on;
+      if (ui.btnCapture) ui.btnCapture.disabled = !on;
+      if (ui.btnLockRoi) ui.btnLockRoi.disabled = !on;
+      if (ui.btnRoiPreset) ui.btnRoiPreset.disabled = !on;
+      if (ui.btnRoiCenterLock) ui.btnRoiCenterLock.disabled = !on;
+      if (ui.btnRoiReset2) ui.btnRoiReset2.disabled = !on;
+
+      if (ui.btnRefWhite) ui.btnRefWhite.disabled = !on;
+      if (ui.btnRefGray) ui.btnRefGray.disabled = !on;
+      if (ui.btnRefClear) ui.btnRefClear.disabled = !on;
+
+      if (ui.btnAutoAdd) ui.btnAutoAdd.disabled = !on;
+      if (ui.btnMark) ui.btnMark.disabled = !on;
+      if (ui.btnClearLog) ui.btnClearLog.disabled = !on;
+
+      if (ui.btnArm) ui.btnArm.disabled = !on;
+      if (ui.btnTryLock) ui.btnTryLock.disabled = !on;
+
+      if (ui.btnGov) ui.btnGov.disabled = false;
+      if (ui.btnSafe) ui.btnSafe.disabled = false;
+    }
+
+    async function startCamera(){
+      camera.wanted = true;
+
+      if (!navigator.mediaDevices?.getUserMedia){
+        setCameraStatus(false, "camera: unsupported");
+        toast("getUserMedia unsupported");
+        if (ui.permRead) ui.permRead.textContent = "permissions: unsupported";
+        if (ui.permDot) setDot(ui.permDot, "bad");
+        return;
+      }
+
+      stopCamera(/*keepWanted*/true);
+
+      camera.devices = await enumerateDevices();
+
+      const preferred = S.preferredDeviceId && camera.devices.find(d=>d.deviceId === S.preferredDeviceId);
+      const deviceId = preferred ? preferred.deviceId : "";
+
+      camera.usingFacing = S.preferredFacing || "environment";
+      camera.deviceId = deviceId;
+
+      // Constraints fallback ladder:
+      //  1) 1080p60
+      //  2) 720p30
+      //  3) 480p30
+      const ladder = [
+        { label:"1080p60", width:1920, height:1080, fps:60 },
+        { label:"720p30",  width:1280, height:720,  fps:30 },
+        { label:"480p30",  width:640,  height:480,  fps:30 }
+      ];
+
+      diag.lastCam.attempts = [];
+      diag.lastCam.lastError = null;
+      diag.lastCam.lastSettings = null;
+      diag.lastCam.chosen = null;
+
+      let stream = null;
+      let chosen = null;
+
+      for (const step of ladder){
+        const constraints = {
+          audio: false,
+          video: {
+            deviceId: deviceId ? { exact: deviceId } : undefined,
+            facingMode: deviceId ? undefined : { ideal: camera.usingFacing },
+            width: { ideal: step.width },
+            height: { ideal: step.height },
+            frameRate: { ideal: step.fps, max: step.fps }
+          }
+        };
+
+        diag.lastCam.attempts.push(step.label);
+
+        try{
+          stream = await navigator.mediaDevices.getUserMedia(constraints);
+          chosen = step;
+          break;
+        }catch(e){
+          diag.lastCam.lastError = String(e && e.name ? e.name : e);
+          // If permission denied, no reason to continue.
+          if (e && (e.name === "NotAllowedError" || e.name === "SecurityError")){
+            break;
+          }
+          // Overconstrained / NotReadable: try next step.
+        }
+      }
+
+      if (!stream){
+        camera.on = false;
+        camera.stream = null;
+        setCameraStatus(false, "camera: denied/error");
+        if (ui.permRead) ui.permRead.textContent = "permissions: denied/error";
+        if (ui.permDot) setDot(ui.permDot, "bad");
+        toast("Camera start failed");
+        diagErr("startCamera", diag.lastCam.lastError || "getUserMedia failed", {attempts: diag.lastCam.attempts});
+        return;
+      }
+
+      camera.stream = stream;
+
+      // attach to both videos (only one visible)
+      try{
+        vid.srcObject = stream;
+        vidLand.srcObject = stream;
+      }catch(e){
+        diagErr("attachVideo", e, null);
+      }
+
+      const track = stream.getVideoTracks()[0];
+      attachTrackHandlers(track);
+
+      // Persist chosen device + facing if available
+      try{
+        const settings = track?.getSettings ? track.getSettings() : {};
+        diag.lastCam.lastSettings = settings || null;
+        if (settings.deviceId){
+          S.preferredDeviceId = settings.deviceId;
+          camera.deviceId = settings.deviceId;
+        }
+        if (settings.facingMode){
+          S.preferredFacing = settings.facingMode;
+        }
+        diag.lastCam.chosen = chosen ? chosen.label : "unknown";
+      }catch(_){}
+
+      try{
+        await Promise.allSettled([vid.play(), vidLand.play()]);
+      }catch(_){}
+
+      try{
+        await applyBestEffortLocks(track);
+      }catch(_){}
+
+      camera.on = true;
+      diag.counters.camStarts++;
+
+      // session timing
+      sessionStart = performance.now();
+      camera.armed = false;
+      S.armed = false;
+      saveState();
+
+      // sampling init
+      camera.maxHz = intClamp(S.maxHz, 5, 60);
+      camera.actualHz = camera.maxHz;
+      if (S.safeMode) camera.actualHz = Math.min(camera.actualHz, 10);
+      camera.nextSampleAt = performance.now();
+      camera.lastSampleAt = 0;
+      camera.sampleIntervalMs = 0;
+      camera.sampleCostEMA = 0;
+
+      camera.lastRaf = performance.now();
+      camera.fpsEMA = 0;
+
+      // reference
+      camera.ref = {...S.ref};
+
+      // ROI: apply stored preset selection (content-rect aware)
+      roiApplyStoredSelection();
+
+      // UI
+      wireEnabled(true);
+      setCameraStatus(true, `camera: live (${diag.lastCam.chosen || "auto"})`);
+      if (ui.permRead){
+        ui.permRead.textContent = "permissions: granted";
+        setDot(ui.permDot, "good");
+      }
+
+      recEvent("camera_start", {chosen: diag.lastCam.chosen, settings: diag.lastCam.lastSettings});
+      toast("Camera started");
+    }
+
+    function stopCamera(keepWanted=false){
+      if (!keepWanted) camera.wanted = false;
+
+      if (camera.on){
+        diag.counters.camStops++;
+        recEvent("camera_stop", {});
+      }
+
+      stopTracks();
+      try{ vid.srcObject = null; }catch(_){}
+      try{ vidLand.srcObject = null; }catch(_){}
+
+      setCameraStatus(true, "camera: idle");
+      setFps(NaN);
+
+      camera.armed = false;
+      S.armed = false;
+      saveState();
+
+      wireEnabled(false);
+    }
+
+    async function switchCamera(){
+      S.preferredDeviceId = "";
+      S.preferredFacing = (S.preferredFacing === "environment") ? "user" : "environment";
+      saveState();
+      await startCamera();
+    }
+
+    /* ---------------------------- Visibility / lifecycle ---------------------------- */
+    function onHide(){
+      // Stop tracks to release camera and avoid background weirdness.
+      // Keep "wanted" state so we can best-effort restart on foreground (permission allowing).
+      stopCamera(/*keepWanted*/true);
+    }
+
+    function onShow(){
+      if (camera.wanted && !camera.on){
+        // Best-effort restart (may fail if gesture required)
+        diag.counters.camRestarts++;
+        startCamera().catch(e=>diagErr("autoRestart", e, null));
+      }
+    }
+
+    window.addEventListener("pagehide", onHide);
+    window.addEventListener("beforeunload", onHide);
+    document.addEventListener("visibilitychange", ()=>{
+      if (document.visibilityState !== "visible") onHide();
+      else onShow();
+    });
+
+    /* ---------------------------- ROI mapping (content-rect aware) ---------------------------- */
+    function getVidEl(){ return isLandscape() ? vidLand : vid; }
+    function getRoiEl(){ return isLandscape() ? roiL : roi; }
+
+    function getContentRect(videoEl){
+      const vr = videoEl.getBoundingClientRect();
+      const vw = videoEl.videoWidth || 0;
+      const vh = videoEl.videoHeight || 0;
+      if (!vw || !vh){
+        return {x:0,y:0,w:vr.width,h:vr.height,vw:0,vh:0,scale:1, vr};
+      }
+      const arV = vw / vh;
+      const arR = vr.width / vr.height;
+      let w,h,x,y;
+      if (arV > arR){
+        w = vr.width;
+        h = w / arV;
+        x = 0;
+        y = (vr.height - h) / 2;
+      } else {
+        h = vr.height;
+        w = h * arV;
+        y = 0;
+        x = (vr.width - w) / 2;
+      }
+      const scale = w / vw; // css px per video px
+      return {x,y,w,h,vw,vh,scale,vr};
+    }
+
+    function deviceKey(){
+      return (camera.deviceId || S.preferredFacing || "cam") + "";
+    }
+
+    function ensurePresetStore(){
+      if (!S.roiPresets) S.roiPresets = {};
+      if (!S.roiPresetSel) S.roiPresetSel = {};
+      const k = deviceKey();
+      if (!S.roiPresets[k]) S.roiPresets[k] = {};
+      if (!S.roiPresetSel[k]) S.roiPresetSel[k] = "Default";
+      if (!S.roiPresets[k]["Default"]){
+        S.roiPresets[k]["Default"] = { unit:"contentPct", l:34, t:34, w:32, h:22 };
+      }
+    }
+
+    // Convert legacy video-percent preset to content-percent using current content rect
+    function presetToContentPct(preset, content){
+      if (!preset) return {unit:"contentPct", l:34,t:34,w:32,h:22};
+      if (preset.unit === "contentPct") return preset;
+
+      // Legacy: percent relative to full video element rect
+      const vr = content.vr;
+      const lpx = (clamp(preset.l,0,100)/100) * vr.width;
+      const tpx = (clamp(preset.t,0,100)/100) * vr.height;
+      const wpx = (clamp(preset.w,1,100)/100) * vr.width;
+      const hpx = (clamp(preset.h,1,100)/100) * vr.height;
+
+      // Map into content rect coords
+      const lc = ((lpx - content.x) / content.w) * 100;
+      const tc = ((tpx - content.y) / content.h) * 100;
+      const wc = (wpx / content.w) * 100;
+      const hc = (hpx / content.h) * 100;
+
+      // Clamp into [0..100] and minimums
+      return { unit:"contentPct",
+        l: clamp(lc,0,100),
+        t: clamp(tc,0,100),
+        w: clamp(wc,3,100),
+        h: clamp(hc,3,100)
+      };
+    }
+
+    // Set ROI styles based on content-rect percent (l/t/w/h relative to visible content)
+    function setRoiRectContentPct(rect){
+      const videoEl = getVidEl();
+      const content = getContentRect(videoEl);
+      const vr = content.vr;
+      if (!vr.width || !vr.height || !content.w || !content.h){
+        // fallback: treat as full element percent
+        const l = clamp(rect.l, 0, 100);
+        const t = clamp(rect.t, 0, 100);
+        const w = clamp(rect.w, 3, 100);
+        const h = clamp(rect.h, 3, 100);
+        for (const el of [roi, roiL]){
+          el.style.left = l + "%";
+          el.style.top = t + "%";
+          el.style.width = w + "%";
+          el.style.height = h + "%";
+        }
+        return;
+      }
+
+      // Convert content% -> element%
+      const lpx = content.x + (clamp(rect.l,0,100)/100) * content.w;
+      const tpx = content.y + (clamp(rect.t,0,100)/100) * content.h;
+      const wpx = (clamp(rect.w,3,100)/100) * content.w;
+      const hpx = (clamp(rect.h,3,100)/100) * content.h;
+
+      const lPct = (lpx / vr.width) * 100;
+      const tPct = (tpx / vr.height) * 100;
+      const wPct = (wpx / vr.width) * 100;
+      const hPct = (hpx / vr.height) * 100;
+
+      for (const el of [roi, roiL]){
+        el.style.left = lPct + "%";
+        el.style.top = tPct + "%";
+        el.style.width = wPct + "%";
+        el.style.height = hPct + "%";
+      }
+    }
+
+    // Read ROI as content-rect percent
+    function getRoiRectContentPct(){
+      const videoEl = getVidEl();
+      const roiEl = getRoiEl();
+      const content = getContentRect(videoEl);
+      const rr = roiEl.getBoundingClientRect();
+
+      if (!content.w || !content.h) return {unit:"contentPct", l:34,t:34,w:32,h:22};
+
+      const rx = rr.left - content.vr.left;
+      const ry = rr.top - content.vr.top;
+
+      const cx = rx - content.x;
+      const cy = ry - content.y;
+
+      const l = (cx / content.w) * 100;
+      const t = (cy / content.h) * 100;
+      const w = (rr.width / content.w) * 100;
+      const h = (rr.height / content.h) * 100;
+
+      return {
+        unit: "contentPct",
+        l: clamp(l, 0, 100),
+        t: clamp(t, 0, 100),
+        w: clamp(w, 3, 100),
+        h: clamp(h, 3, 100)
+      };
+    }
+
+    function roiSnapAndClampContentPct(rect){
+      // min size: both px and % terms
+      const videoEl = getVidEl();
+      const content = getContentRect(videoEl);
+
+      const minPct = 3; // absolute minimum in %
+      let minW = minPct, minH = minPct;
+
+      // px minimum converted to %
+      const minPx = 28;
+      if (content.w > 0 && content.h > 0){
+        minW = Math.max(minW, (minPx / content.w) * 100);
+        minH = Math.max(minH, (minPx / content.h) * 100);
+      }
+
+      let l = clamp(rect.l, 0, 100);
+      let t = clamp(rect.t, 0, 100);
+      let w = clamp(rect.w, minW, 100);
+      let h = clamp(rect.h, minH, 100);
+
+      // snap to bounds
+      if (l + w > 100) l = 100 - w;
+      if (t + h > 100) t = 100 - h;
+
+      return {unit:"contentPct", l, t, w, h};
+    }
+
+    function roiApplyStoredSelection(){
+      ensurePresetStore();
+      const k = deviceKey();
+      const sel = S.roiPresetSel[k] || "Default";
+      const videoEl = getVidEl();
+      const content = getContentRect(videoEl);
+
+      let preset = (S.roiPresets[k] && S.roiPresets[k][sel]) ? S.roiPresets[k][sel] : S.roiPresets[k]["Default"];
+      preset = presetToContentPct(preset, content);
+      preset = roiSnapAndClampContentPct(preset);
+
+      // write back as contentPct to prevent repeated legacy drift
+      S.roiPresets[k][sel] = preset;
+      saveState();
+
+      setRoiRectContentPct(preset);
+    }
+
+    function roiResetToDefault(){
+      ensurePresetStore();
+      const k = deviceKey();
+      const def = S.roiPresets[k]["Default"] || {unit:"contentPct", l:34,t:34,w:32,h:22};
+      setRoiRectContentPct(roiSnapAndClampContentPct(def));
+      const sel = S.roiPresetSel[k] || "Default";
+      S.roiPresets[k][sel] = getRoiRectContentPct();
+      saveState();
+      recEvent("roi_reset", {sel});
+      toast("ROI reset");
+    }
+
+    function roiToVideoPixels(){
+      const videoEl = getVidEl();
+      const roiRect = getRoiRectContentPct();
+      const content = getContentRect(videoEl);
+
+      if (!content.vw || !content.vh || !content.w || !content.h){
+        return {vx:0, vy:0, vw:0, vh:0};
+      }
+
+      const r = roiSnapAndClampContentPct(roiRect);
+
+      // content% -> content px (CSS)
+      const ix = (r.l/100) * content.w;
+      const iy = (r.t/100) * content.h;
+      const iw = (r.w/100) * content.w;
+      const ih = (r.h/100) * content.h;
+
+      // CSS content px -> video px using scale
+      const vx = Math.round(ix / content.scale);
+      const vy = Math.round(iy / content.scale);
+      const vw = Math.round(iw / content.scale);
+      const vh = Math.round(ih / content.scale);
+
+      // clamp to video bounds
+      const vx2 = clamp(vx, 0, content.vw);
+      const vy2 = clamp(vy, 0, content.vh);
+      const vw2 = clamp(vw, 0, content.vw - vx2);
+      const vh2 = clamp(vh, 0, content.vh - vy2);
+
+      return {vx: vx2|0, vy: vy2|0, vw: vw2|0, vh: vh2|0};
+    }
+
+    function openRoiPresetDialog(){
+      if (!camera.on){
+        toast("Start camera first (needed for accurate ROI mapping)");
+        return;
+      }
+      ensurePresetStore();
+      const k = deviceKey();
+      roiCamKeyRead.textContent = `camera: ${k}`;
+      roiPresetName.value = "";
+
+      roiPresetList.innerHTML = "";
+      const presets = Object.keys(S.roiPresets[k] || {}).sort((a,b)=>a.localeCompare(b));
+      for (const name of presets){
+        const opt = document.createElement("option");
+        opt.value = name;
+        opt.textContent = name;
+        roiPresetList.appendChild(opt);
+      }
+      roiPresetList.value = S.roiPresetSel[k] || "Default";
+
+      openModal(roiModal);
+    }
+
+    function saveRoiPreset(name, overwrite=false){
+      name = (name || "").trim().slice(0, 24);
+      if (!name) return false;
+      ensurePresetStore();
+      const k = deviceKey();
+      if (!overwrite && S.roiPresets[k][name]) return false;
+
+      const rect = roiSnapAndClampContentPct(getRoiRectContentPct());
+      S.roiPresets[k][name] = rect;
+      S.roiPresetSel[k] = name;
+      saveState();
+      recEvent("roi_preset_save", {name});
+      return true;
+    }
+
+    function loadRoiPreset(name){
+      ensurePresetStore();
+      const k = deviceKey();
+      const preset = S.roiPresets[k][name];
+      if (!preset) return false;
+
+      const content = getContentRect(getVidEl());
+      const fixed = roiSnapAndClampContentPct(presetToContentPct(preset, content));
+      setRoiRectContentPct(fixed);
+
+      S.roiPresets[k][name] = fixed;
+      S.roiPresetSel[k] = name;
+      saveState();
+      recEvent("roi_preset_load", {name});
+      return true;
+    }
+
+    function deleteRoiPreset(name){
+      ensurePresetStore();
+      const k = deviceKey();
+      if (name === "Default") return false;
+      if (!S.roiPresets[k][name]) return false;
+      delete S.roiPresets[k][name];
+      if (S.roiPresetSel[k] === name) S.roiPresetSel[k] = "Default";
+      saveState();
+      recEvent("roi_preset_delete", {name});
+      return true;
+    }
+
+    btnRoiLoad.addEventListener("click", ()=>{
+      const name = roiPresetList.value;
+      if (loadRoiPreset(name)) toast("Preset loaded");
+      else toast("Load failed");
+      openRoiPresetDialog(); // refresh list + selection
+    });
+
+    btnRoiDelete.addEventListener("click", ()=>{
+      const name = roiPresetList.value;
+      if (name === "Default") return toast("Can't delete Default");
+      if (!confirm(`Delete ROI preset "${name}"?`)) return;
+      if (deleteRoiPreset(name)) toast("Preset deleted");
+      else toast("Delete failed");
+      openRoiPresetDialog();
+    });
+
+    btnRoiSave.addEventListener("click", ()=>{
+      const name = roiPresetName.value;
+      const ok = saveRoiPreset(name, false);
+      toast(ok ? "Preset saved" : "Name exists / invalid");
+      openRoiPresetDialog();
+    });
+
+    btnRoiOverwrite.addEventListener("click", ()=>{
+      const name = roiPresetList.value;
+      if (!name) return;
+      if (name === "Default"){
+        // allow overwrite Default as a "reset baseline"
+      } else if (!confirm(`Overwrite preset "${name}"?`)){
+        return;
+      }
+      const ok = saveRoiPreset(name, true);
+      toast(ok ? "Preset overwritten" : "Overwrite failed");
+      openRoiPresetDialog();
+    });
+
+    btnRoiReset.addEventListener("click", ()=> roiResetToDefault());
+
+    /* ---------------------------- ROI pointer interaction (content-rect space) ---------------------------- */
+    const roiState = { active:false, mode:"move", handle:"", startX:0, startY:0, rect0:null, pointerId:0 };
+
+    function roiPointerDown(ev){
+      if (S.roiLocked) return;
+      if (!camera.on) return;
+      const handle = ev.target?.dataset?.h || "";
+      roiState.active = true;
+      roiState.handle = handle;
+      roiState.mode = handle ? "resize" : "move";
+      roiState.startX = ev.clientX;
+      roiState.startY = ev.clientY;
+      roiState.pointerId = ev.pointerId;
+
+      const videoEl = getVidEl();
+      const content = getContentRect(videoEl);
+
+      // base rect in content% (stable under letterboxing)
+      const r0 = roiSnapAndClampContentPct(getRoiRectContentPct());
+      roiState.rect0 = { ...r0, contentW: content.w, contentH: content.h };
+
+      getRoiEl().setPointerCapture(ev.pointerId);
+      ev.preventDefault();
+    }
+
+    function roiPointerMove(ev){
+      if (!roiState.active || S.roiLocked) return;
+
+      const dx = ev.clientX - roiState.startX;
+      const dy = ev.clientY - roiState.startY;
+      const r0 = roiState.rect0;
+
+      // Convert dx/dy in CSS px to content%
+      const dL = r0.contentW ? (dx / r0.contentW) * 100 : 0;
+      const dT = r0.contentH ? (dy / r0.contentH) * 100 : 0;
+
+      let l=r0.l, t=r0.t, w=r0.w, h=r0.h;
+
+      if (roiState.mode === "move"){
+        l = r0.l + dL;
+        t = r0.t + dT;
+      } else {
+        const hnd = roiState.handle;
+
+        // If center lock is on, resizing should keep center fixed
+        const cx0 = r0.l + r0.w/2;
+        const cy0 = r0.t + r0.h/2;
+
+        let dl = 0, dt = 0, dw = 0, dh = 0;
+        if (hnd.includes("l")){ dl = dL; dw = -dL; }
+        if (hnd.includes("r")){ dw = dL; }
+        if (hnd.includes("t")){ dt = dT; dh = -dT; }
+        if (hnd.includes("b")){ dh = dT; }
+
+        l = r0.l + dl;
+        t = r0.t + dt;
+        w = r0.w + dw;
+        h = r0.h + dh;
+
+        if (S.roiCenterLock){
+          w = r0.w + dw;
+          h = r0.h + dh;
+          l = cx0 - w/2;
+          t = cy0 - h/2;
+        }
+      }
+
+      const rect = roiSnapAndClampContentPct({l,t,w,h});
+      setRoiRectContentPct(rect);
+
+      ev.preventDefault();
+    }
+
+    function roiPointerUp(ev){
+      if (!roiState.active) return;
+      roiState.active = false;
+      try{ getRoiEl().releasePointerCapture(ev.pointerId); }catch(_){}
+
+      ensurePresetStore();
+      const k = deviceKey();
+      const sel = S.roiPresetSel[k] || "Default";
+      S.roiPresets[k][sel] = roiSnapAndClampContentPct(getRoiRectContentPct());
+      saveState();
+      recEvent("roi_commit", {sel});
+
+      ev.preventDefault();
+    }
+
+    for (const el of [roi, roiL]){
+      el.addEventListener("pointerdown", roiPointerDown, {passive:false});
+      el.addEventListener("pointermove", roiPointerMove, {passive:false});
+      el.addEventListener("pointerup", roiPointerUp, {passive:false});
+      el.addEventListener("pointercancel", roiPointerUp, {passive:false});
+    }
+
+    /* ---------------------------- Flicker + stability ---------------------------- */
+    const STAB_MAX = 90; // ~3s at 30Hz
+    const stabV = new Float32Array(STAB_MAX);
+    const stabH = new Float32Array(STAB_MAX);
+    let stabN = 0, stabI = 0;
+
+    function stabPush(h,v){
+      stabH[stabI] = h;
+      stabV[stabI] = v;
+      stabI = (stabI + 1) % STAB_MAX;
+      stabN = Math.min(STAB_MAX, stabN + 1);
+    }
+
+    function goertzelPower(x, N, k){
+      // Goertzel for a single bin (k) in N samples
+      const w = (2 * Math.PI * k) / N;
+      const cw = Math.cos(w);
+      const coeff = 2 * cw;
+      let s0=0, s1=0, s2=0;
+      for (let i=0;i<N;i++){
+        s0 = x[i] + coeff*s1 - s2;
+        s2 = s1;
+        s1 = s0;
+      }
+      const power = s1*s1 + s2*s2 - coeff*s1*s2;
+      return power;
+    }
+
+    function flickerHint(sampleHz){
+      // candidate flicker freqs; return dominant if signal supports it
+      const candidates = [50, 60, 100, 120, 150, 180, 240];
+      const N = Math.min(stabN, 80);
+      if (N < 28 || !sampleHz) return {freq:0, strength:0};
+
+      // build contiguous window newest->oldest normalized (avoid alloc: use small local array)
+      // We'll compute mean and subtract to remove DC.
+      let mean = 0;
+      for (let i=0;i<N;i++){
+        const idx = (stabI - 1 - i + STAB_MAX) % STAB_MAX;
+        mean += stabV[idx];
+      }
+      mean /= N;
+
+      const x = new Float32Array(N);
+      for (let i=0;i<N;i++){
+        const idx = (stabI - 1 - i + STAB_MAX) % STAB_MAX;
+        x[i] = stabV[idx] - mean;
+      }
+
+      // For each candidate frequency f, compute nearest bin index for N samples at sampleHz
+      let best = {freq:0, strength:0};
+      let totalP = 1e-9;
+      for (const f of candidates){
+        // bin k = f * N / Fs
+        const k = (f * N) / sampleHz;
+        const ki = Math.max(1, Math.min(N-1, Math.round(k)));
+        const p = goertzelPower(x, N, ki);
+        totalP += p;
+        if (p > best.strength){
+          best = {freq:f, strength:p};
+        }
+      }
+      // Strength ratio
+      const ratio = best.strength / totalP;
+      return {freq: best.freq, strength: ratio};
+    }
+
+    function stabStats(sampleHz){
+      if (stabN < 10) return {vMean:0, vStd:0, hStd:0, flicker:false, flickerScore:0, freq:0, freqStrength:0};
+
+      let sumV=0;
+      for (let k=0;k<stabN;k++){
+        const idx = (stabI - 1 - k + STAB_MAX) % STAB_MAX;
+        sumV += stabV[idx];
+      }
+      const vMean = sumV / stabN;
+
+      let sumSq=0;
+      for (let k=0;k<stabN;k++){
+        const idx = (stabI - 1 - k + STAB_MAX) % STAB_MAX;
+        const dv = stabV[idx] - vMean;
+        sumSq += dv*dv;
+      }
+      const vStd = Math.sqrt(sumSq / Math.max(1, (stabN - 1)));
+
+      // Circular hue std
+      let sx=0, sy=0;
+      for (let k=0;k<stabN;k++){
+        const idx = (stabI - 1 - k + STAB_MAX) % STAB_MAX;
+        const rad = (stabH[idx] * Math.PI) / 180;
+        sx += Math.cos(rad);
+        sy += Math.sin(rad);
+      }
+      const meanRad = Math.atan2(sy, sx);
+      const meanDeg = (meanRad * 180 / Math.PI + 360) % 360;
+
+      let sumH2=0;
+      for (let k=0;k<stabN;k++){
+        const idx = (stabI - 1 - k + STAB_MAX) % STAB_MAX;
+        const dh = circHueDelta(stabH[idx], meanDeg);
+        sumH2 += dh*dh;
+      }
+      const hStd = Math.sqrt(sumH2 / Math.max(1, (stabN - 1)));
+
+      // Simple sign-change + CV score
+      let signChanges = 0;
+      let prevSign = 0;
+      const K = Math.min(stabN-1, 60);
+      for (let k=0;k<K; k++){
+        const idxA = (stabI - 1 - k + STAB_MAX) % STAB_MAX;
+        const idxB = (stabI - 2 - k + STAB_MAX) % STAB_MAX;
+        const dv = stabV[idxA] - stabV[idxB];
+        const sign = dv > 0 ? 1 : (dv < 0 ? -1 : 0);
+        if (sign !== 0 && prevSign !== 0 && sign !== prevSign) signChanges++;
+        if (sign !== 0) prevSign = sign;
+      }
+
+      const cv = vMean > 0 ? (vStd / vMean) : 0;
+      const flickerScore = (cv * 1.8) + (signChanges / 60);
+      const flicker = flickerScore > 0.20 && vMean > 0.06; // ignore near-black
+
+      const fh = flickerHint(sampleHz);
+      return {vMean, vStd, hStd, flicker, flickerScore, freq: fh.freq, freqStrength: fh.strength};
+    }
+
+    function qualityScore(sample, stats){
+      const sat = clamp(sample.s, 0, 1);
+      const val = clamp(sample.v, 0, 1);
+      const stability = clamp(1 - (stats.hStd / 18), 0, 1) * 0.55 + clamp(1 - (stats.vStd / 0.08), 0, 1) * 0.45;
+      const base = 0.45 * sat + 0.35 * val + 0.20 * stability;
+      return clamp(base, 0, 1);
+    }
+
+    /* ---------------------------- Governor (stable + reporting) ---------------------------- */
+    const HZ_STEPS = [60,30,20,15,10,5];
+    const GOV = {
+      lastAdjust: 0,
+      lowCount: 0,
+      highCount: 0
+    };
+
+    function governorTick(){
+      if (!S.govEnabled) return;
+
+      const fps = camera.fpsEMA || 0;
+      const now = performance.now();
+      if (now - GOV.lastAdjust < 1800) return;
+
+      // Consider both FPS and sampling cost budget
+      const cost = camera.sampleCostEMA || 0;
+      const costBad = cost > 7.5; // ms (budget heuristic)
+      const fpsBad = fps && fps < 18;
+
+      if (fpsBad || costBad){
+        GOV.lowCount++;
+        GOV.highCount = Math.max(0, GOV.highCount - 1);
+      } else if (fps && fps > 35 && cost < 4.5){
+        GOV.highCount++;
+        GOV.lowCount = Math.max(0, GOV.lowCount - 1);
+      }
+
+      if (GOV.lowCount >= 2){
+        const idx = HZ_STEPS.indexOf(camera.actualHz);
+        const next = (idx >= 0 && idx < HZ_STEPS.length - 1) ? HZ_STEPS[idx + 1] : camera.actualHz;
+        const minHz = S.safeMode ? 5 : 5;
+        const clamped = Math.max(minHz, next);
+        if (clamped !== camera.actualHz){
+          camera.actualHz = clamped;
+          GOV.lastAdjust = now;
+          GOV.lowCount = 0;
+          recEvent("governor_down", {hz: camera.actualHz, fps, cost});
+          toast(`Governor: ${camera.actualHz} Hz`);
+        }
+      }
+
+      if (GOV.highCount >= 3){
+        const targetMax = intClamp(S.maxHz, 5, 60);
+        const target = S.safeMode ? Math.min(targetMax, 10) : targetMax;
+        if (camera.actualHz < target){
+          const stepsAsc = [...HZ_STEPS].sort((a,b)=>a-b);
+          let next = camera.actualHz;
+          for (const s of stepsAsc){
+            if (s > camera.actualHz && s <= target) { next = s; break; }
+          }
+          if (next !== camera.actualHz){
+            camera.actualHz = next;
+            GOV.lastAdjust = now;
+            GOV.highCount = 0;
+            recEvent("governor_up", {hz: camera.actualHz, fps, cost});
+          }
+        } else {
+          GOV.highCount = 0;
+        }
+      }
+    }
+
+    /* ---------------------------- Audio + haptics ---------------------------- */
+    function vibrate(pattern){
+      if (!S.haptics) return;
+      if (navigator.vibrate) navigator.vibrate(pattern);
+    }
+
+    function ensureAudio(){
+      if (!S.sound) return null;
+      if (camera.audioCtx) return camera.audioCtx;
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return null;
+      camera.audioCtx = new AC();
+      return camera.audioCtx;
+    }
+
+    function beep(){
+      const ctx = ensureAudio();
+      if (!ctx) return;
+      if (ctx.state === "suspended") ctx.resume().catch(()=>{});
+      const o = ctx.createOscillator();
+      const g = ctx.createGain();
+      o.type = "sine";
+      o.frequency.value = 880;
+      g.gain.value = 0.0001;
+      o.connect(g);
+      g.connect(ctx.destination);
+      o.start();
+      const t0 = ctx.currentTime;
+      g.gain.exponentialRampToValueAtTime(0.08, t0 + 0.01);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.12);
+      o.stop(t0 + 0.13);
+    }
+
+    /* ---------------------------- Sampling (adaptive + robust) ---------------------------- */
+    let lastSample = null;
+    const sampleTmp = {t:0,r:0,g:0,b:0,h:0,s:0,v:0,cond:false,conf:0};
+
+    function applyRef(r,g,b){
+      if (!camera.ref.enabled) return {r,g,b};
+      r = clamp(r * camera.ref.gainR, 0, 255);
+      g = clamp(g * camera.ref.gainG, 0, 255);
+      b = clamp(b * camera.ref.gainB, 0, 255);
+      return {r: r|0, g: g|0, b: b|0};
+    }
+
+    function computeAdaptiveSampleSize(vw, vh){
+      // Target sampled pixel count (controls getImageData cost).
+      // Scale with Hz, clamp, and reduce further in safe mode.
+      const hz = Math.max(5, camera.actualHz || 30);
+      let target = 4000 * (30 / hz);      // 60Hz => ~2000, 10Hz => ~12000
+      target = clamp(target, 900, 6500);
+      if (S.safeMode) target = Math.min(target, 1600);
+
+      const area = Math.max(1, vw * vh);
+      const scale = Math.min(1, Math.sqrt(target / area));
+      const sw = Math.max(2, Math.floor(vw * scale));
+      const sh = Math.max(2, Math.floor(vh * scale));
+
+      return {sw, sh};
+    }
+
+    function trimmedMeanRGB(data, maxSamples){
+      // Robust mean: two-pass luminance outlier rejection.
+      // No allocations beyond loop vars.
+      const len = data.length;
+      const pxCount = (len / 4) | 0;
+      if (pxCount <= 0) return {r:0,g:0,b:0};
+
+      // stride to bound sampled pixels
+      const stride = Math.max(1, Math.floor(Math.sqrt(pxCount / maxSamples)));
+      let n1=0, sumL=0, sumL2=0;
+
+      for (let i=0;i<len;i+=4*stride){
+        const r=data[i], g=data[i+1], b=data[i+2];
+        const l = 0.2126*r + 0.7152*g + 0.0722*b;
+        sumL += l;
+        sumL2 += l*l;
+        n1++;
+      }
+      if (n1 < 4) n1 = 4;
+
+      const meanL = sumL / n1;
+      const varL = Math.max(0, (sumL2 / n1) - meanL*meanL);
+      const stdL = Math.sqrt(varL) || 0;
+
+      // reject outside mean ± k*std; k chosen to ignore spikes
+      const k = 2.3;
+      const lo = meanL - k*stdL;
+      const hi = meanL + k*stdL;
+
+      let n2=0, sr=0, sg=0, sb=0;
+      for (let i=0;i<len;i+=4*stride){
+        const r=data[i], g=data[i+1], b=data[i+2];
+        const l = 0.2126*r + 0.7152*g + 0.0722*b;
+        if (l < lo || l > hi) continue;
+        sr += r; sg += g; sb += b;
+        n2++;
+      }
+
+      // Fallback if everything rejected
+      if (n2 < Math.max(6, n1*0.2)){
+        sr=0; sg=0; sb=0; n2=0;
+        for (let i=0;i<len;i+=4*stride){
+          sr += data[i]; sg += data[i+1]; sb += data[i+2];
+          n2++;
+        }
+      }
+
+      return {r: sr/n2, g: sg/n2, b: sb/n2};
+    }
+
+    function computeConfidence(sample, stats){
+      // 0..1 score: S/V margin + stability
+      const smin = clamp(S.sMin, 0, 1);
+      const vmin = clamp(S.vMin, 0, 1);
+
+      const sMargin = clamp((sample.s - smin) / Math.max(1e-6, (1 - smin)), 0, 1);
+      const vMargin = clamp((sample.v - vmin) / Math.max(1e-6, (1 - vmin)), 0, 1);
+
+      const stability = clamp(1 - (stats.hStd / 18), 0, 1) * 0.55 + clamp(1 - (stats.vStd / 0.08), 0, 1) * 0.45;
+
+      return clamp(0.42*sMargin + 0.42*vMargin + 0.16*stability, 0, 1);
+    }
+
+    function deriveHueRange(){
+      if (S.hueMode === "center"){
+        const c = intClamp(S.hCenter, 0, 360);
+        const w = clamp(S.hWidth, 0, 360);
+        const half = w / 2;
+        let min = c - half;
+        let max = c + half;
+
+        // normalize into [0..360]
+        while (min < 0) min += 360;
+        while (min > 360) min -= 360;
+        while (max < 0) max += 360;
+        while (max > 360) max -= 360;
+
+        // If width >= 360 treat as full range
+        if (w >= 360) { min = 0; max = 360; }
+
+        return {hMin: Math.round(min), hMax: Math.round(max)};
+      }
+      return {hMin: intClamp(S.hMin, 0, 360), hMax: intClamp(S.hMax, 0, 360)};
+    }
+
+    function sampleOnce(){
+      const vEl = getVidEl();
+      if (!camera.on || !vEl.videoWidth || !vEl.videoHeight) return;
+
+      const tNow = performance.now();
+      diag.counters.sample++;
+
+      const {vx, vy, vw, vh} = roiToVideoPixels();
+
+      // Update ROI caption only when changed (avoid per-sample DOM)
+      const capText = (vw > 0 && vh > 0) ? `${vw}×${vh}px` : "ROI";
+      if (capText !== roiCapLast){
+        roiCapLast = capText;
+        roiCap.textContent = capText;
+        roiCapL.textContent = capText;
+      }
+
+      if (vw <= 2 || vh <= 2){
+        lastSample = null;
+        return;
+      }
+
+      // Adaptive downscale
+      const {sw, sh} = computeAdaptiveSampleSize(vw, vh);
+      if (sw !== sampW || sh !== sampH){
+        sampW = sw; sampH = sh;
+        sampC.width = sw;
+        sampC.height = sh;
+      }
+
+      // draw from the portrait video if available (shared stream); otherwise current
+      const srcVid = vid.videoWidth ? vid : vEl;
+
+      const t0 = performance.now();
+      try{
+        sampX.drawImage(srcVid, vx, vy, vw, vh, 0, 0, sw, sh);
+      }catch(e){
+        diag.counters.sampleFail++;
+        diagErr("drawImage", e, {vx,vy,vw,vh,sw,sh});
+        return;
+      }
+
+      let img;
+      try{
+        img = sampX.getImageData(0,0,sw,sh);
+      }catch(e){
+        diag.counters.sampleFail++;
+        diagErr("getImageData", e, {sw,sh});
+        return;
+      }
+      const data = img.data;
+
+      // robust mean
+      const maxSamples = S.safeMode ? 700 : 1400;
+      const mean = trimmedMeanRGB(data, maxSamples);
+
+      // Apply reference correction
+      const corr = applyRef(mean.r, mean.g, mean.b);
+      const rr = intClamp(corr.r, 0, 255);
+      const gg = intClamp(corr.g, 0, 255);
+      const bb = intClamp(corr.b, 0, 255);
+
+      const hsv = rgbToHsv(rr,gg,bb);
+
+      // stability + flicker stats
+      stabPush(hsv.h, hsv.v);
+      const stats = stabStats(1000 / Math.max(1, camera.sampleIntervalMs || (1000/camera.actualHz)));
+
+      // Trigger condition (raw)
+      const {hMin, hMax} = deriveHueRange();
+      const smin = clamp(S.sMin, 0, 1);
+      const vmin = clamp(S.vMin, 0, 1);
+
+      const inHue = hueInRange(hsv.h, hMin, hMax);
+      const passesSV = (hsv.s >= smin) && (hsv.v >= vmin);
+
+      const inside = inHue && passesSV;
+      const rawCond = (S.mode === "inside") ? inside : (!inHue && passesSV);
+
+      // Hold-time stabilization
+      const holdMs = intClamp(S.holdMs, 0, 60000);
+      if (rawCond){
+        if (!camera.rawTrueSince) camera.rawTrueSince = tNow;
+      } else {
+        camera.rawTrueSince = 0;
+      }
+      const stableCond = rawCond && (holdMs === 0 || (camera.rawTrueSince && (tNow - camera.rawTrueSince) >= holdMs));
+
+      // Confidence (display + logs)
+      const conf = computeConfidence({s:hsv.s, v:hsv.v}, stats);
+
+      // Update sample interval + drops
+      if (camera.lastSampleAt){
+        const interval = tNow - camera.lastSampleAt;
+        camera.sampleIntervalMs = interval;
+        const expected = 1000 / Math.max(5, camera.actualHz || 30);
+        if (interval > expected * 1.8) diag.counters.sampleDrops++;
+      }
+      camera.lastSampleAt = tNow;
+
+      // sample cost EMA
+      const cost = performance.now() - t0;
+      camera.sampleCostEMA = camera.sampleCostEMA ? (camera.sampleCostEMA*0.9 + cost*0.1) : cost;
+
+      // Store sample
+      const t = Math.round(performance.now() - sessionStart);
+      sampleTmp.t = t;
+      sampleTmp.r = rr; sampleTmp.g = gg; sampleTmp.b = bb;
+      sampleTmp.h = hsv.h; sampleTmp.s = hsv.s; sampleTmp.v = hsv.v;
+      sampleTmp.cond = stableCond;
+      sampleTmp.conf = conf;
+
+      lastSample = {...sampleTmp};
+
+      histPush(lastSample);
+      paletteMaybeAdd(lastSample, false);
+
+      sessRows.push({t, r: rr, g: gg, b: bb, h: hsv.h, s: hsv.s, v: hsv.v, cond: stableCond, conf, ev:""});
+      if (sessRows.length > SESSION_MAX_ROWS) sessRows.shift();
+
+      pushCondStrip(stableCond);
+
+      // Trigger firing (rising edge of stable condition) with debounce + cooldown
+      if (camera.armed){
+        const debounceMs = intClamp(S.debounceMs, 0, 60000);
+        const cooldownMs = intClamp(S.cooldownMs, 0, 60000);
+        const minGap = Math.max(debounceMs, cooldownMs);
+        const rising = (stableCond && !camera.lastStable);
+
+        if (rising && (tNow - camera.lastFireAt) >= minGap){
+          camera.lastFireAt = tNow;
+          diag.counters.trigger++;
+          const label = `TRIGGER #${diag.counters.trigger}`;
+          sessRows[sessRows.length - 1].ev = label;
+          recEvent("trigger", {count: diag.counters.trigger, h: hsv.h, s: hsv.s, v: hsv.v, conf, rgb:[rr,gg,bb]});
+          logLine(`[${nowISO()}] ${label} @ +${t}ms | conf=${fmt(conf,2)} | H=${fmt(hsv.h,1)} S=${fmt(hsv.s,3)} V=${fmt(hsv.v,3)} | RGB ${rr},${gg},${bb}`);
+          vibrate([15, 30, 15]);
+          beep();
+          toast(label);
+        }
+      }
+
+      camera.lastStable = stableCond;
+
+      // Throttled UI update (~10fps)
+      if (tNow - uiLastUpdate > 90){
+        uiLastUpdate = tNow;
+        updateLiveUI(lastSample, stats);
+      }
+    }
+
+    function updateLiveUI(sample, stats){
+      if (!ui.swatch) return;
+
+      ui.swatch.style.background = `rgb(${sample.r},${sample.g},${sample.b})`;
+      ui.rgbRead.textContent = `RGB: ${sample.r}, ${sample.g}, ${sample.b}`;
+      ui.hsvRead.textContent = `HSV: H ${fmt(sample.h,1)}° | S ${fmt(sample.s,3)} | V ${fmt(sample.v,3)}`;
+
+      const {vx, vy, vw, vh} = roiToVideoPixels();
+      ui.roiRead.textContent = `ROI: ${vw}×${vh} @ (${vx},${vy})`;
+
+      const q = qualityScore(sample, stats);
+      ui.qualBar.style.width = `${Math.round(q*100)}%`;
+      ui.qualTag.textContent = `quality ${Math.round(q*100)}%`;
+      setQualDot(q);
+
+      const fh = (stats.freq && stats.freqStrength > 0.18) ? ` · ~${stats.freq}Hz` : "";
+      ui.flickRead.textContent = stats.flicker
+        ? `flicker: HIGH (${fmt(stats.flickerScore,2)})${fh}`
+        : `flicker: ok (${fmt(stats.flickerScore,2)})${fh}`;
+      setDot(ui.flickDot, stats.flicker ? "warn" : "good");
+
+      if (ui.camHint){
+        if (stats.flicker){
+          ui.camHint.textContent = "Tip: flicker detected → try LED preset (lower Hz), increase hold/debounce, or enable Safe mode.";
+        } else {
+          ui.camHint.textContent = diag.lastCam.chosen ? `Camera: ${diag.lastCam.chosen}.` : "";
+        }
+      }
+
+      if (ui.hzTag){
+        ui.hzTag.textContent = `Hz ${camera.actualHz}/${S.maxHz}`;
+      }
+
+      if (ui.govRead){
+        const interval = camera.sampleIntervalMs ? `${Math.round(camera.sampleIntervalMs)}ms` : "—";
+        ui.govRead.textContent = `gov: ${S.govEnabled ? "ON" : "OFF"} · ${camera.actualHz}Hz · Δ ${interval} · drop ${diag.counters.sampleDrops}`;
+        const st = (camera.actualHz >= Math.min(S.maxHz, S.safeMode ? 10 : 60)) ? "good" : "warn";
+        setDot(ui.govDot, st);
+      }
+
+      if (ui.condRead){
+        ui.condRead.textContent = `cond: ${sample.cond ? "TRUE" : "false"}`;
+        setDot(ui.condDot, sample.cond ? "good" : "warn");
+      }
+      if (ui.confRead){
+        ui.confRead.textContent = `confidence: ${Math.round((sample.conf||0)*100)}%`;
+      }
+
+      drawTimeline();
+      renderDiagnostics();
+      refreshButtons();
+    }
+
+    function rafLoop(t){
+      diag.counters.raf++;
+
+      const dt = t - camera.lastRaf;
+      camera.lastRaf = t;
+      const inst = dt > 0 ? (1000/dt) : 0;
+      camera.fpsEMA = camera.fpsEMA ? (camera.fpsEMA*0.9 + inst*0.1) : inst;
+      setFps(camera.fpsEMA);
+
+      if (camera.on){
+        const interval = Math.max(5, Math.floor(1000 / Math.max(5, camera.actualHz || 30)));
+        if (t >= camera.nextSampleAt){
+          // If we're late, schedule next relative to now (avoid accumulating lag)
+          camera.nextSampleAt = t + interval;
+          sampleOnce();
+          governorTick();
+        }
+      }
+
+      // palette persistence debounce flush
+      paletteFlushSave(false);
+
+      requestAnimationFrame(rafLoop);
+    }
+
+    /* ---------------------------- Timeline ---------------------------- */
+    const tlCanvas = panels.scan.querySelector("#tlCanvas");
+    const tlCtx = tlCanvas.getContext("2d", { alpha:false });
+    const tlScrub = panels.scan.querySelector("#tlScrub");
+    const tlPickRead = panels.scan.querySelector("#tlPickRead");
+    const btnAddPick = panels.scan.querySelector("#btnAddPick");
+    let tlPicked = null;
+
+    function drawTimeline(){
+      const w = tlCanvas.width, h = tlCanvas.height;
+      tlCtx.fillStyle = "#07070b";
+      tlCtx.fillRect(0,0,w,h);
+
+      if (hist.n === 0) return;
+
+      const nowT = Math.round(performance.now() - sessionStart);
+      const minT = Math.max(0, nowT - HISTORY_SECONDS*1000);
+
+      const cols = 180;
+      const colW = w / cols;
+
+      for (let c=0;c<cols;c++){
+        const tm = minT + ((c+0.5)/cols) * (HISTORY_SECONDS*1000);
+        let samp = null;
+        for (let k=0; k<hist.n; k++){
+          const idx = (hist.i - 1 - k + HISTORY_MAX) % HISTORY_MAX;
+          const tt = hist.t[idx];
+          if (!tt) continue;
+          if (tt <= tm){
+            if (tt < minT) break;
+            samp = {r:hist.r[idx], g:hist.g[idx], b:hist.b[idx], cond:!!hist.cond[idx]};
+            break;
+          }
+        }
+        if (!samp) continue;
+
+        tlCtx.fillStyle = `rgb(${samp.r},${samp.g},${samp.b})`;
+        tlCtx.fillRect(c*colW, 0, colW+1, h-22);
+
+        if (samp.cond){
+          tlCtx.fillStyle = "rgba(74,222,128,.85)";
+          tlCtx.fillRect(c*colW, h-22, colW+1, 6);
+        }
+      }
+
+      const secAgo = Number(tlScrub.value || 0);
+      const x = w - (secAgo / HISTORY_SECONDS) * w;
+      tlCtx.fillStyle = "rgba(255,255,255,.80)";
+      tlCtx.fillRect(x-1, 0, 2, h);
+
+      tlCtx.fillStyle = "rgba(0,0,0,.55)";
+      tlCtx.fillRect(0, h-22, w, 22);
+      tlCtx.fillStyle = "rgba(255,255,255,.75)";
+      tlCtx.font = "12px " + getComputedStyle(document.documentElement).getPropertyValue("--mono");
+      tlCtx.fillText("60s ago", 10, h-7);
+      tlCtx.fillText("now", w-42, h-7);
+    }
+
+    function updateTimelinePick(){
+      const secAgo = Number(tlScrub.value || 0);
+      const pick = histGetAtSecondsAgo(secAgo);
+      tlPicked = pick;
+      if (!pick){
+        tlPickRead.textContent = "pick: —";
+        btnAddPick.disabled = true;
+        return;
+      }
+      const hex = rgbToHex(pick.r, pick.g, pick.b);
+      tlPickRead.textContent = `pick: ${hex} @ -${fmt(secAgo,1)}s`;
+      btnAddPick.disabled = false;
+    }
+
+    tlScrub.addEventListener("input", updateTimelinePick);
+
+    btnAddPick.addEventListener("click", ()=>{
+      if (!tlPicked) return;
+      paletteMaybeAdd({...tlPicked, passesSV:true}, true);
+      clusters = null;
+      renderPalette();
+      toast("Added picked color");
+      recEvent("history_add", {t: tlPicked.t, hex: rgbToHex(tlPicked.r, tlPicked.g, tlPicked.b)});
+    });
+
+    /* ---------------------------- Condition strip ---------------------------- */
+    const COND_STRIP_N = 50;
+    const condStrip = panels.trigger.querySelector("#condStrip");
+    const condSegs = [];
+    (function initStrip(){
+      for (let i=0;i<COND_STRIP_N;i++){
+        const d = document.createElement("div");
+        d.className = "seg off";
+        condStrip.appendChild(d);
+        condSegs.push(d);
+      }
+    })();
+    let condStripIdx = 0;
+    function pushCondStrip(on){
+      const el = condSegs[condStripIdx];
+      el.classList.toggle("on", !!on);
+      el.classList.toggle("off", !on);
+      condStripIdx = (condStripIdx + 1) % COND_STRIP_N;
+    }
+
+    /* ---------------------------- Logging ---------------------------- */
+    function logLine(line){
+      if (ui.log){
+        ui.log.textContent += line + "\n";
+        ui.log.scrollTop = ui.log.scrollHeight;
+      }
+    }
+
+    function markManual(){
+      if (!camera.on) return;
+      const t = Math.round(performance.now() - sessionStart);
+      const label = `MARK #${diag.counters.trigger + 1}`;
+      sessRows.push({t, r:"", g:"", b:"", h:"", s:"", v:"", cond:false, conf:0, ev:label});
+      if (sessRows.length > SESSION_MAX_ROWS) sessRows.shift();
+      recEvent("mark", {});
+      logLine(`[${nowISO()}] ${label} @ +${t}ms`);
+      toast(label);
+      refreshButtons();
+    }
+
+    function clearLog(){
+      if (ui.log) ui.log.textContent = "";
+      sessRows.length = 0;
+      sessEvents.length = 0;
+      diag.counters.trigger = 0;
+      stabN = 0; stabI = 0;
+      hist.n = 0; hist.i = 0;
+      tlPicked = null;
+      updateTimelinePick();
+      recEvent("clear", {});
+      toast("Cleared");
+      refreshButtons();
+    }
+
+    /* ---------------------------- Reference capture ---------------------------- */
+    function captureReference(type){
+      if (!lastSample) return toast("No sample yet");
+      const target = (type === "gray") ? 128 : 255;
+      const r = lastSample.r, g = lastSample.g, b = lastSample.b;
+      const eps = 1e-3;
+      const gainR = clamp(target / Math.max(eps, r), 0.3, 3.5);
+      const gainG = clamp(target / Math.max(eps, g), 0.3, 3.5);
+      const gainB = clamp(target / Math.max(eps, b), 0.3, 3.5);
+
+      S.ref = { enabled:true, type, gainR, gainG, gainB };
+      camera.ref = {...S.ref};
+      saveState();
+
+      if (ui.refTag) ui.refTag.textContent = type;
+      recEvent("ref_set", {type, gainR, gainG, gainB});
+      toast(`Ref set: ${type.toUpperCase()}`);
+    }
+
+    function clearReference(){
+      S.ref = { enabled:false, type:"", gainR:1, gainG:1, gainB:1 };
+      camera.ref = {...S.ref};
+      saveState();
+      if (ui.refTag) ui.refTag.textContent = "off";
+      recEvent("ref_clear", {});
+      toast("Ref cleared");
+    }
+
+    /* ---------------------------- Palette UI: search parsing ---------------------------- */
+    function parseSearch(q){
+      q = (q || "").trim().toLowerCase();
+      if (!q) return {type:"empty"};
+
+      // #rgb / #rrggbb
+      const hex = q.startsWith("#") ? q.slice(1) : q;
+      if (/^[0-9a-f]{3}$/.test(hex)){
+        const r = parseInt(hex[0]+hex[0],16);
+        const g = parseInt(hex[1]+hex[1],16);
+        const b = parseInt(hex[2]+hex[2],16);
+        return {type:"hexExact", hex: rgbToHex(r,g,b).toLowerCase()};
+      }
+      if (/^[0-9a-f]{6}$/.test(hex)){
+        return {type:"hexExact", hex: ("#" + hex).toLowerCase()};
+      }
+
+      // rgb(...) or "r,g,b"
+      const m = q.match(/(\d{1,3})\s*[, ]\s*(\d{1,3})\s*[, ]\s*(\d{1,3})/);
+      if (m){
+        const r = intClamp(m[1],0,255), g = intClamp(m[2],0,255), b = intClamp(m[3],0,255);
+        return {type:"rgbExact", r,g,b, key:`${r},${g},${b}`};
+      }
+
+      // partial
+      return {type:"partial", q};
+    }
+
+    function matchesSearch(it, pq){
+      if (!pq || pq.type === "empty") return true;
+
+      if (pq.type === "hexExact"){
+        return it.hex.toLowerCase() === pq.hex;
+      }
+      if (pq.type === "rgbExact"){
+        // allow small tolerance for quantized keys
+        const dr = it.r - pq.r, dg = it.g - pq.g, db = it.b - pq.b;
+        const d = Math.abs(dr) + Math.abs(dg) + Math.abs(db);
+        return d <= 20;
+      }
+      if (pq.type === "partial"){
+        const q = pq.q;
+        if (it.hex.toLowerCase().includes(q)) return true;
+        const rgb = `${it.r},${it.g},${it.b}`;
+        if (rgb.includes(q.replace(/\s+/g,""))) return true;
+        return false;
+      }
+      return true;
+    }
+
+    function groupBucketLabel(h, bucketSize){
+      const b = Math.floor((h||0) / bucketSize) * bucketSize;
+      const e = (b + bucketSize) % 360;
+      return `${b}–${e}°`;
+    }
+
+    /* ---------------------------- Perceptual-ish clustering distance ---------------------------- */
+    function distPerceptual(a,b){
+      // Luma-weighted RGB distance (cheap)
+      const dr = (a.r - b.r) * 0.30;
+      const dg = (a.g - b.g) * 0.59;
+      const db = (a.b - b.b) * 0.11;
+      return Math.sqrt(dr*dr + dg*dg + db*db);
+    }
+
+    function computeClusters(thr){
+      const K = Math.min(S.safeMode ? 260 : 420, palMap.size);
+      const items = Array.from(palMap.values()).sort((a,b)=>b.count - a.count).slice(0, K);
+
+      const used = new Uint8Array(items.length);
+      const out = [];
+
+      for (let i=0;i<items.length;i++){
+        if (used[i]) continue;
+        used[i] = 1;
+        const cl = {keys:[items[i].key], rep: items[i]};
+        for (let j=i+1;j<items.length;j++){
+          if (used[j]) continue;
+          if (distPerceptual(items[i], items[j]) <= thr){
+            used[j] = 1;
+            cl.keys.push(items[j].key);
+          }
+        }
+        out.push(cl);
+      }
+
+      out.sort((a,b)=> b.keys.length - a.keys.length);
+      return out;
+    }
+
+    /* ---------------------------- Render palette ---------------------------- */
+    function renderClusters(){
+      if (!ui.clusterOut) return;
+      ui.clusterOut.style.display = "block";
+
+      if (!clusters){
+        const thr = intClamp(ui.cluThr.value, 6, 120);
+        clusters = computeClusters(thr);
+      }
+
+      const total = clusters.reduce((a,c)=>a + c.keys.length, 0);
+      const merged = clusters.filter(c=>c.keys.length>1).length;
+
+      ui.clusterOut.textContent =
+        `Clusters: ${clusters.length} groups, ${merged} mergeable. Analyzed: ${total} colors (top by count).`;
+      ui.btnMerge.disabled = !(merged > 0);
+    }
+
+    function renderPalette(){
+      if (!ui.paletteGrid) return;
+
+      const pq = parseSearch(S.palSearch || "");
+      const group = S.palGroup === "off" ? 0 : intClamp(S.palGroup, 10, 180);
+
+      let arr = paletteExportList(true).filter(it=> matchesSearch(it, pq));
+      const activeSet = S.sets?.active || "Default";
+      const activeKeys = new Set(S.sets?.items?.[activeSet] || []);
+
+      const buckets = new Map();
+      if (group){
+        for (const it of arr){
+          const label = groupBucketLabel(it.h || 0, group);
+          if (!buckets.has(label)) buckets.set(label, []);
+          buckets.get(label).push(it);
+        }
+        const ordered = Array.from(buckets.keys()).sort((a,b)=>{
+          const na = parseInt(a.split("–")[0],10)||0;
+          const nb = parseInt(b.split("–")[0],10)||0;
+          return na - nb;
+        });
+        const out = [];
+        for (const k of ordered){
+          out.push({__header:true, label:k});
+          out.push(...buckets.get(k));
+        }
+        arr = out;
+      }
+
+      if (clusterMode){
+        renderClusters();
+      } else if (ui.clusterOut){
+        ui.clusterOut.style.display = "none";
+      }
+
+      ui.paletteGrid.innerHTML = "";
+      const frag = document.createDocumentFragment();
+
+      for (const it of arr){
+        if (it.__header){
+          const h = document.createElement("div");
+          h.className = "pCard";
+          h.style.background = "rgba(255,255,255,.03)";
+          h.style.borderColor = "rgba(255,255,255,.10)";
+          h.innerHTML = `<div class="pB"><div class="pHex" style="color:var(--muted); text-transform:uppercase; letter-spacing:.08em;">${it.label}</div><div class="pMeta">bucket grouping</div></div>`;
+          frag.appendChild(h);
+          continue;
+        }
+
+        const inSet = activeKeys.has(it.key);
+        const card = document.createElement("div");
+        card.className = "pCard" + (palSelMode ? " selMode" : "") + (palSelected.has(it.key) ? " selected" : "");
+        card.dataset.k = it.key;
+
+        const pinLabel = it.pinned ? `<div class="pin">PINNED</div>` : "";
+        const chip = inSet ? `<div class="chip">SET</div>` : "";
+        card.innerHTML = `
+          <div class="pSw" style="background:${it.hex}">${chip}${pinLabel}</div>
+          <div class="pB">
+            <div class="pHex">${it.hex}</div>
+            <div class="pMeta">rgb(${it.r},${it.g},${it.b}) · H ${fmt(it.h,1)}°</div>
+            <div class="pMeta">seen ${it.count}×</div>
+            <div class="pBtns">
+              <button class="btn" data-act="copy" aria-label="Copy color hex">Copy</button>
+              <button class="btn ${it.pinned ? "primary" : ""}" data-act="pin" aria-label="Toggle pin">${it.pinned ? "Unpin" : "Pin"}</button>
+              <button class="btn" data-act="addset" aria-label="Add or remove from set">${inSet ? "Remove" : "Add"}</button>
+            </div>
+          </div>
+          <div class="selBox" aria-hidden="true">✓</div>
+        `;
+        frag.appendChild(card);
+      }
+
+      ui.paletteGrid.appendChild(frag);
+      ui.palTag.textContent = `${palMap.size}`;
+
+      refreshButtons();
+      paletteScheduleSave(); // small persist cadence; actual flush is debounced
+    }
+
+    panels.palette.querySelector("#paletteGrid").addEventListener("click", async (ev)=>{
+      const card = ev.target.closest(".pCard");
+      if (!card) return;
+      const key = card.dataset.k;
+      if (!key || !palMap.has(key)) return;
+
+      const btn = ev.target.closest("button");
+      if (!btn && palSelMode){
+        if (palSelected.has(key)) palSelected.delete(key);
+        else palSelected.add(key);
+        renderPalette();
+        return;
+      }
+      if (!btn) return;
+
+      const act = btn.dataset.act;
+      const it = palMap.get(key);
+      if (!it) return;
+
+      if (act === "copy"){
+        await copyText(it.hex);
+        return;
+      }
+      if (act === "pin"){
+        it.pinned = !it.pinned;
+        clusters = null;
+        recEvent("palette_pin", {key, on: it.pinned});
+        toast(it.pinned ? "Pinned" : "Unpinned");
+        renderPalette();
+        return;
+      }
+      if (act === "addset"){
+        ensureSets();
+        const setName = S.sets.active || "Default";
+        const arr = S.sets.items[setName] || [];
+        if (arr.includes(key)){
+          S.sets.items[setName] = arr.filter(x=>x !== key);
+          recEvent("set_remove", {set:setName, key});
+          toast("Removed from set");
+        } else {
+          arr.push(key);
+          S.sets.items[setName] = arr.slice(0, 3000);
+          recEvent("set_add", {set:setName, key});
+          toast("Added to set");
+        }
+        saveState();
+        renderSets();
+        renderPalette();
+        return;
+      }
+    });
+
+    function renderSets(){
+      if (!ui.setSel) return;
+      ensureSets();
+      ui.setSel.innerHTML = "";
+      const names = Object.keys(S.sets.items);
+      names.sort((a,b)=> a.localeCompare(b));
+      for (const name of names){
+        const opt = document.createElement("option");
+        opt.value = name;
+        opt.textContent = name + (name === S.sets.active ? " (active)" : "");
+        ui.setSel.appendChild(opt);
+      }
+      ui.setSel.value = S.sets.active;
+      ui.setTag.textContent = `${S.sets.active} (${(S.sets.items[S.sets.active]||[]).length})`;
+    }
+
+    /* ---------------------------- Diagnostics render ---------------------------- */
+    function storageEstimate(){
+      // Rough estimate: sum lengths of stored strings
+      let total = 0;
+      try{
+        const s1 = localStorage.getItem(APP.keyState) || "";
+        const s2 = localStorage.getItem(APP.keyPalette) || "";
+        total = s1.length + s2.length;
+      }catch(_){}
+      return total;
+    }
+
+    function renderDiagnostics(){
+      if (!ui.diagReadA) return;
+
+      const hz = camera.on ? camera.actualHz : 0;
+      const cost = camera.sampleCostEMA || 0;
+      const storeKB = Math.round(storageEstimate() / 1024);
+      const errN = diag.errors.length;
+
+      const a = [
+        `cam:${camera.on ? "on" : "off"}`,
+        `hz:${hz}`,
+        `cost:${fmt(cost,1)}ms`,
+        `drops:${diag.counters.sampleDrops}`,
+        `fails:${diag.counters.sampleFail}`,
+        `pal:${palMap.size}`,
+        `store:${storeKB}KB`
+      ].join(" · ");
+
+      const settings = diag.lastCam.lastSettings || {};
+      const b = camera.on
+        ? `track: ${settings.width||"?"}×${settings.height||"?"} @${settings.frameRate||"?"}fps · facing:${settings.facingMode||S.preferredFacing||"?"}`
+        : `last: ${diag.lastCam.chosen || "—"} · err:${diag.lastCam.lastError || "—"}`;
+
+      ui.diagReadA.textContent = a;
+      ui.diagReadB.textContent = b;
+      ui.diagTag.textContent = errN ? `${errN} err` : "ok";
+
+      if (ui.diagErrs){
+        if (!errN){
+          ui.diagErrs.textContent = "No recent errors.";
+        } else {
+          const tail = diag.errors.slice(-6).map(e=>`• ${e.t} · ${e.where}: ${e.msg}`).join("\n");
+          ui.diagErrs.textContent = tail;
+        }
+      }
+    }
+
+    function diagSnapshot(){
+      const snap = {
+        app: APP,
+        time: nowISO(),
+        state: S,
+        diag,
+        palette_count: palMap.size,
+        session_rows: sessRows.length,
+        session_events: sessEvents.length
+      };
+      return JSON.stringify(snap, null, 2);
+    }
+
+    /* ---------------------------- Sharing + bundle ---------------------------- */
+    async function shareText(){
+      if (!navigator.share) return toast("Share unsupported");
+      const keys = (S.exportSelectedOnly && palSelMode && palSelected.size) ? Array.from(palSelected) : null;
+      const text = paletteExportHexText(keys);
+      try{
+        await navigator.share({ title:"Palette HEX", text });
+      }catch(_){
+        toast("Share canceled/failed");
+      }
+    }
+
+    async function shareFiles(){
+      if (!navigator.share || !navigator.canShare) return toast("File share unsupported");
+
+      const keys = (S.exportSelectedOnly && palSelMode && palSelected.size) ? Array.from(palSelected) : null;
+
+      const files = [];
+      const st = stamp();
+
+      if (palMap.size){
+        files.push(new File([paletteJSON(keys)], `palette_${st}.json`, {type:"application/json"}));
+        files.push(new File([paletteCSV(keys)], `palette_${st}.csv`, {type:"text/csv"}));
+      }
+      if (sessRows.length || sessEvents.length){
+        files.push(new File([sessionJSON()], `session_${st}.json`, {type:"application/json"}));
+        files.push(new File([sessionCSV()], `session_${st}.csv`, {type:"text/csv"}));
+      }
+
+      try{
+        if (!navigator.canShare({files})) {
+          toast("This browser can't share files");
+          return;
+        }
+        await navigator.share({ title:"Color session files", files });
+      }catch(_){
+        toast("Share canceled/failed");
+      }
+    }
+
+    function exportBundle(){
+      const st = stamp();
+      const keys = (S.exportSelectedOnly && palSelMode && palSelected.size) ? Array.from(palSelected) : null;
+
+      const manifest = {
+        exported_at: nowISO(),
+        app: APP.name,
+        build: APP.build,
+        schema: APP.schema,
+        device: {
+          ua: navigator.userAgent,
+          platform: navigator.platform || "",
+          cores: navigator.hardwareConcurrency || null,
+          mem_gb: navigator.deviceMemory || null,
+          screen: {w: screen.width, h: screen.height, dpr: window.devicePixelRatio || 1}
+        },
+        settings_snapshot: S,
+        last_camera: diag.lastCam,
+        counts: {
+          palette_total: palMap.size,
+          palette_exported: keys ? keys.length : palMap.size,
+          session_rows: sessRows.length,
+          session_events: sessEvents.length
+        },
+        files: []
+      };
+
+      const downloads = [];
+
+      if (palMap.size){
+        const pn = `palette_${st}.json`;
+        const pc = `palette_${st}.csv`;
+        downloads.push({name: pn, text: paletteJSON(keys), mime:"application/json"});
+        downloads.push({name: pc, text: paletteCSV(keys), mime:"text/csv"});
+        manifest.files.push({name: pn, type:"palette_json"});
+        manifest.files.push({name: pc, type:"palette_csv"});
+      }
+      if (sessRows.length || sessEvents.length){
+        const sn = `session_${st}.json`;
+        const sc = `session_${st}.csv`;
+        downloads.push({name: sn, text: sessionJSON(), mime:"application/json"});
+        downloads.push({name: sc, text: sessionCSV(), mime:"text/csv"});
+        manifest.files.push({name: sn, type:"session_json"});
+        manifest.files.push({name: sc, type:"session_csv"});
+      }
+
+      const mn = `manifest_${st}.json`;
+      downloads.unshift({name: mn, text: JSON.stringify(manifest, null, 2), mime:"application/json"});
+
+      for (const d of downloads){
+        downloadTextReliable(d.name, d.text, d.mime);
+      }
+      toast("Bundle exported");
+      recEvent("bundle_export", {n: downloads.length});
+    }
+
+    /* ---------------------------- Bottom sheet snapping ---------------------------- */
+    const SHEET = {
+      y: 0,
+      snap: 0.55,
+      dragging:false,
+      startY:0,
+      startTranslate:0
+    };
+
+    function sheetSetSnap(frac){
+      frac = clamp(frac, 0.20, 0.92);
+      SHEET.snap = frac;
+      const h = window.innerHeight;
+      const navH = parseInt(getComputedStyle(document.documentElement).getPropertyValue("--navH")) || 62;
+      const y = Math.round((1 - frac) * (h - navH));
+      setSheetY(y, true);
+    }
+
+    function setSheetY(px, animate){
+      const h = window.innerHeight;
+      const navH = parseInt(getComputedStyle(document.documentElement).getPropertyValue("--navH")) || 62;
+      const maxY = Math.round(h - navH - 120);
+      const minY = 0;
+      px = intClamp(px, minY, maxY);
+      SHEET.y = px;
+      sheet.style.transition = animate ? "transform .18s ease" : "none";
+      sheet.style.transform = `translateY(${px}px)`;
+    }
+
+    function nearestSnap(y){
+      const h = window.innerHeight;
+      const navH = parseInt(getComputedStyle(document.documentElement).getPropertyValue("--navH")) || 62;
+      const maxY = Math.round(h - navH - 120);
+      const snaps = [
+        {frac:0.20, y: Math.round(maxY)},
+        {frac:0.55, y: Math.round((1-0.55)*(h-navH))},
+        {frac:0.90, y: Math.round((1-0.90)*(h-navH))}
+      ];
+      let best = snaps[0];
+      let bd = Infinity;
+      for (const s of snaps){
+        const d = Math.abs(y - s.y);
+        if (d < bd){ bd = d; best = s; }
+      }
+      return best;
+    }
+
+    function sheetPointerDown(ev){
+      SHEET.dragging = true;
+      SHEET.startY = ev.clientY;
+      SHEET.startTranslate = SHEET.y;
+      sheetGrab.setPointerCapture(ev.pointerId);
+      ev.preventDefault();
+    }
+
+    function sheetPointerMove(ev){
+      if (!SHEET.dragging) return;
+      const dy = ev.clientY - SHEET.startY;
+      setSheetY(SHEET.startTranslate + dy, false);
+      ev.preventDefault();
+    }
+
+    function sheetPointerUp(ev){
+      if (!SHEET.dragging) return;
+      SHEET.dragging = false;
+      try{ sheetGrab.releasePointerCapture(ev.pointerId); }catch(_){}
+      const snap = nearestSnap(SHEET.y);
+      sheetSetSnap(snap.frac);
+      ev.preventDefault();
+    }
+
+    sheetGrab.addEventListener("pointerdown", sheetPointerDown, {passive:false});
+    sheetGrab.addEventListener("pointermove", sheetPointerMove, {passive:false});
+    sheetGrab.addEventListener("pointerup", sheetPointerUp, {passive:false});
+    sheetGrab.addEventListener("pointercancel", sheetPointerUp, {passive:false});
+
+    btnSnap.addEventListener("click", ()=>{
+      const s = SHEET.snap;
+      if (s < 0.30) sheetSetSnap(0.55);
+      else if (s < 0.70) sheetSetSnap(0.90);
+      else sheetSetSnap(0.20);
+    });
+
+    /* ---------------------------- Bind UI refs + wiring ---------------------------- */
+    function refreshButtons(force=false){
+      if (ui.scanStatTag){
+        ui.scanStatTag.textContent = camera.on ? "live" : "idle";
+      }
+      if (ui.permRead && force){
+        ui.permRead.textContent = navigator.mediaDevices?.getUserMedia ? "permissions: ready" : "permissions: unsupported";
+        setDot(ui.permDot, navigator.mediaDevices?.getUserMedia ? "good" : "bad");
+      }
+      if (ui.evTag){
+        ui.evTag.textContent = String(diag.counters.trigger || 0);
+      }
+      if (ui.btnLockRoi){
+        ui.btnLockRoi.textContent = S.roiLocked ? "Lock ROI: ON" : "Lock ROI";
+      }
+      if (ui.btnRoiCenterLock){
+        ui.btnRoiCenterLock.textContent = `Center lock: ${S.roiCenterLock ? "ON" : "OFF"}`;
+      }
+
+      // Trigger button state
+      if (ui.btnArm){
+        ui.btnArm.textContent = `Armed: ${camera.armed ? "ON" : "OFF"}`;
+        ui.trigRead.textContent = camera.armed ? "trigger: armed" : "trigger: idle";
+        setDot(ui.trigDot, camera.armed ? "warn" : "warn");
+        ui.trigTag.textContent = camera.armed ? "armed" : "idle";
+        ui.btnArm.classList.toggle("good", !camera.armed);
+        ui.btnArm.classList.toggle("bad", camera.armed);
+      }
+
+      const hasPal = palMap.size > 0;
+      if (ui.btnCopyHex) ui.btnCopyHex.disabled = !hasPal;
+      if (ui.btnCopyCss) ui.btnCopyCss.disabled = !hasPal;
+      if (ui.btnPalClear) ui.btnPalClear.disabled = !hasPal;
+
+      if (ui.btnToSet) ui.btnToSet.disabled = !(palSelMode && palSelected.size > 0);
+      if (ui.btnDelSel) ui.btnDelSel.disabled = !(palSelMode && palSelected.size > 0);
+
+      if (ui.btnCopyHex2) ui.btnCopyHex2.disabled = !hasPal;
+      if (ui.btnCopyCss2) ui.btnCopyCss2.disabled = !hasPal;
+      if (ui.btnDlPalJson) ui.btnDlPalJson.disabled = !hasPal;
+      if (ui.btnDlPalCsv) ui.btnDlPalCsv.disabled = !hasPal;
+
+      const hasSess = sessRows.length > 0 || sessEvents.length > 0;
+      if (ui.btnDlSessJson) ui.btnDlSessJson.disabled = !hasSess;
+      if (ui.btnDlSessCsv) ui.btnDlSessCsv.disabled = !hasSess;
+
+      if (ui.btnShareText) ui.btnShareText.disabled = !(navigator.share && hasPal);
+      const canFiles = !!(navigator.share && navigator.canShare);
+      if (ui.btnShareFiles) ui.btnShareFiles.disabled = !(canFiles && (hasPal || hasSess));
+      if (ui.btnBundle) ui.btnBundle.disabled = !(hasPal || hasSess);
+
+      if (ui.selRead){
+        ui.selRead.textContent = `selected: ${palSelMode ? palSelected.size : 0}`;
+      }
+      if (ui.btnSelOnly){
+        ui.btnSelOnly.textContent = `Selected only: ${S.exportSelectedOnly ? "ON" : "OFF"}`;
+      }
+    }
+
+    function bindUIRefs(which){
+      // reset ui object (avoid stale refs)
+      for (const k in ui) delete ui[k];
+
+      if (which === "scan"){
+        ui.btnStart = panels.scan.querySelector("#btnStart");
+        ui.btnStop = panels.scan.querySelector("#btnStop");
+        ui.btnSwitch = panels.scan.querySelector("#btnSwitch");
+        ui.btnCapture = panels.scan.querySelector("#btnCapture");
+        ui.btnLockRoi = panels.scan.querySelector("#btnLockRoi");
+        ui.btnRoiPreset = panels.scan.querySelector("#btnRoiPreset");
+        ui.btnRoiCenterLock = panels.scan.querySelector("#btnRoiCenterLock");
+        ui.btnRoiReset2 = panels.scan.querySelector("#btnRoiReset2");
+
+        ui.permDot = panels.scan.querySelector("#permDot");
+        ui.permRead = panels.scan.querySelector("#permRead");
+        ui.govDot = panels.scan.querySelector("#govDot");
+        ui.govRead = panels.scan.querySelector("#govRead");
+        ui.camHint = panels.scan.querySelector("#camHint");
+        ui.scanStatTag = panels.scan.querySelector("#scanStatTag");
+
+        ui.swatch = panels.scan.querySelector("#swatch");
+        ui.rgbRead = panels.scan.querySelector("#rgbRead");
+        ui.hsvRead = panels.scan.querySelector("#hsvRead");
+        ui.roiRead = panels.scan.querySelector("#roiRead");
+
+        ui.qualBar = panels.scan.querySelector("#qualBar");
+        ui.qualTag = panels.scan.querySelector("#qualTag");
+        ui.flickDot = panels.scan.querySelector("#flickDot");
+        ui.flickRead = panels.scan.querySelector("#flickRead");
+
+        ui.btnRefWhite = panels.scan.querySelector("#btnRefWhite");
+        ui.btnRefGray = panels.scan.querySelector("#btnRefGray");
+        ui.btnRefClear = panels.scan.querySelector("#btnRefClear");
+        ui.refTag = panels.scan.querySelector("#refTag");
+
+        ui.selHz = panels.scan.querySelector("#selHz");
+        ui.hzTag = panels.scan.querySelector("#hzTag");
+        ui.btnAutoAdd = panels.scan.querySelector("#btnAutoAdd");
+        ui.btnHaptic = panels.scan.querySelector("#btnHaptic");
+        ui.btnSound = panels.scan.querySelector("#btnSound");
+        ui.btnSafe = panels.scan.querySelector("#btnSafe");
+        ui.btnGov = panels.scan.querySelector("#btnGov");
+
+        ui.log = panels.scan.querySelector("#log");
+        ui.btnMark = panels.scan.querySelector("#btnMark");
+        ui.btnClearLog = panels.scan.querySelector("#btnClearLog");
+        ui.evTag = panels.scan.querySelector("#evTag");
+
+        ui.diagReadA = panels.scan.querySelector("#diagReadA");
+        ui.diagReadB = panels.scan.querySelector("#diagReadB");
+        ui.diagErrs = panels.scan.querySelector("#diagErrs");
+        ui.diagTag = panels.scan.querySelector("#diagTag");
+        ui.btnCopyDiag = panels.scan.querySelector("#btnCopyDiag");
+        ui.btnClearErr = panels.scan.querySelector("#btnClearErr");
+
+        ui.btnStart.onclick = startCamera;
+        ui.btnStop.onclick = ()=> stopCamera(false);
+        ui.btnSwitch.onclick = switchCamera;
+
+        ui.btnCapture.onclick = ()=>{
+          if (!lastSample) return toast("No sample yet");
+          paletteMaybeAdd(lastSample, true);
+          clusters = null;
+          renderPalette();
+          toast("Captured");
+        };
+
+        ui.btnLockRoi.onclick = ()=> setRoiLocked(!S.roiLocked);
+        ui.btnRoiPreset.onclick = ()=> openRoiPresetDialog();
+        ui.btnRoiCenterLock.onclick = ()=> setRoiCenterLock(!S.roiCenterLock);
+        ui.btnRoiReset2.onclick = ()=> roiResetToDefault();
+
+        ui.btnRefWhite.onclick = ()=> captureReference("white");
+        ui.btnRefGray.onclick = ()=> captureReference("gray");
+        ui.btnRefClear.onclick = ()=> clearReference();
+
+        ui.selHz.value = String(intClamp(S.maxHz, 5, 60));
+        ui.selHz.onchange = ()=>{
+          S.maxHz = intClamp(ui.selHz.value, 5, 60);
+          camera.maxHz = S.maxHz;
+          const cap = S.safeMode ? 10 : 60;
+          camera.actualHz = Math.min(camera.actualHz, Math.min(S.maxHz, cap));
+          saveState();
+          recEvent("set_maxHz", {hz:S.maxHz});
+          toast(`Max Hz: ${S.maxHz}`);
+        };
+
+        ui.btnAutoAdd.onclick = ()=>{
+          S.palAutoAdd = !S.palAutoAdd;
+          saveState();
+          recEvent("pal_auto", {on:S.palAutoAdd});
+          ui.btnAutoAdd.textContent = `Auto: ${S.palAutoAdd ? "ON" : "OFF"}`;
+          toast(ui.btnAutoAdd.textContent);
+        };
+
+        ui.btnSafe.onclick = ()=>{
+          S.safeMode = !S.safeMode;
+          saveState();
+          recEvent("safe_mode", {on:S.safeMode});
+          ui.btnSafe.textContent = `Safe: ${S.safeMode ? "ON" : "OFF"}`;
+          if (camera.on){
+            camera.actualHz = Math.min(camera.actualHz, S.safeMode ? 10 : intClamp(S.maxHz,5,60));
+          }
+          toast(ui.btnSafe.textContent);
+        };
+
+        ui.btnGov.onclick = ()=>{
+          S.govEnabled = !S.govEnabled;
+          saveState();
+          recEvent("gov", {on:S.govEnabled});
+          ui.btnGov.textContent = `Gov: ${S.govEnabled ? "ON" : "OFF"}`;
+          toast(ui.btnGov.textContent);
+        };
+
+        ui.btnHaptic.onclick = ()=>{
+          S.haptics = !S.haptics;
+          saveState();
+          recEvent("haptics", {on:S.haptics});
+          ui.btnHaptic.textContent = `Haptics: ${S.haptics ? "ON" : "OFF"}`;
+          if (S.haptics) vibrate([10]);
+        };
+
+        ui.btnSound.onclick = ()=>{
+          S.sound = !S.sound;
+          saveState();
+          recEvent("sound", {on:S.sound});
+          ui.btnSound.textContent = `Sound: ${S.sound ? "ON" : "OFF"}`;
+          if (S.sound){
+            ensureAudio();
+            beep();
+          }
+        };
+
+        ui.btnMark.onclick = markManual;
+        ui.btnClearLog.onclick = clearLog;
+
+        ui.btnCopyDiag.onclick = async ()=> await copyText(diagSnapshot());
+        ui.btnClearErr.onclick = ()=>{
+          diag.errors.length = 0;
+          toast("Errors cleared");
+          renderDiagnostics();
+        };
+
+        ui.btnAutoAdd.textContent = `Auto: ${S.palAutoAdd ? "ON" : "OFF"}`;
+        ui.btnHaptic.textContent = `Haptics: ${S.haptics ? "ON" : "OFF"}`;
+        ui.btnSound.textContent = `Sound: ${S.sound ? "ON" : "OFF"}`;
+        ui.btnSafe.textContent = `Safe: ${S.safeMode ? "ON" : "OFF"}`;
+        ui.btnGov.textContent = `Gov: ${S.govEnabled ? "ON" : "OFF"}`;
+        ui.refTag.textContent = S.ref.enabled ? `${S.ref.type}` : "off";
+        ui.btnRoiCenterLock.textContent = `Center lock: ${S.roiCenterLock ? "ON" : "OFF"}`;
+
+        updateTimelinePick();
+        renderDiagnostics();
+      }
+
+      if (which === "trigger"){
+        ui.btnArm = panels.trigger.querySelector("#btnArm");
+        ui.trigDot = panels.trigger.querySelector("#trigDot");
+        ui.trigRead = panels.trigger.querySelector("#trigRead");
+        ui.condDot = panels.trigger.querySelector("#condDot");
+        ui.condRead = panels.trigger.querySelector("#condRead");
+        ui.confRead = panels.trigger.querySelector("#confRead");
+
+        ui.hueMode = panels.trigger.querySelector("#hueMode");
+        ui.mode = panels.trigger.querySelector("#mode");
+
+        ui.hMin = panels.trigger.querySelector("#hMin");
+        ui.hMax = panels.trigger.querySelector("#hMax");
+        ui.hMinRead = panels.trigger.querySelector("#hMinRead");
+        ui.hMaxRead = panels.trigger.querySelector("#hMaxRead");
+
+        ui.hCenter = panels.trigger.querySelector("#hCenter");
+        ui.hWidth = panels.trigger.querySelector("#hWidth");
+        ui.hCenterRead = panels.trigger.querySelector("#hCenterRead");
+        ui.hWidthRead = panels.trigger.querySelector("#hWidthRead");
+
+        ui.minmaxRow = panels.trigger.querySelector("#minmaxRow");
+        ui.centerRow = panels.trigger.querySelector("#centerRow");
+
+        ui.hueSelA = panels.trigger.querySelector("#hueSelA");
+        ui.hueSelB = panels.trigger.querySelector("#hueSelB");
+
+        ui.wrapTag = panels.trigger.querySelector("#wrapTag");
+        ui.wrapDot = panels.trigger.querySelector("#wrapDot");
+        ui.wrapRead = panels.trigger.querySelector("#wrapRead");
+
+        ui.sMin = panels.trigger.querySelector("#sMin");
+        ui.vMin = panels.trigger.querySelector("#vMin");
+        ui.debounce = panels.trigger.querySelector("#debounce");
+        ui.hold = panels.trigger.querySelector("#hold");
+        ui.cooldown = panels.trigger.querySelector("#cooldown");
+        ui.btnTryLock = panels.trigger.querySelector("#btnTryLock");
+
+        ui.preLED = panels.trigger.querySelector("#preLED");
+        ui.preScreen = panels.trigger.querySelector("#preScreen");
+        ui.prePaper = panels.trigger.querySelector("#prePaper");
+        ui.preNeon = panels.trigger.querySelector("#preNeon");
+
+        ui.trigTag = panels.trigger.querySelector("#trigTag");
+        ui.timTag = panels.trigger.querySelector("#timTag");
+
+        ui.hueMode.value = S.hueMode || "minmax";
+        ui.mode.value = S.mode || "inside";
+
+        ui.hMin.value = String(intClamp(S.hMin,0,360));
+        ui.hMax.value = String(intClamp(S.hMax,0,360));
+        ui.hCenter.value = String(intClamp(S.hCenter,0,360));
+        ui.hWidth.value = String(intClamp(S.hWidth,0,360));
+
+        ui.sMin.value = String(clamp(S.sMin,0,1));
+        ui.vMin.value = String(clamp(S.vMin,0,1));
+        ui.debounce.value = String(intClamp(S.debounceMs,0,60000));
+        ui.hold.value = String(intClamp(S.holdMs,0,60000));
+        ui.cooldown.value = String(intClamp(S.cooldownMs,0,60000));
+
+        ui.btnTryLock.textContent = `Lock: ${S.tryLock ? "ON" : "OFF"}`;
+
+        function updateHueUI(){
+          // reflect mode rows
+          const mode = ui.hueMode.value === "center" ? "center" : "minmax";
+          S.hueMode = mode;
+          ui.minmaxRow.style.display = (mode === "minmax") ? "" : "none";
+          ui.centerRow.style.display = (mode === "center") ? "" : "none";
+
+          if (mode === "minmax"){
+            S.hMin = intClamp(ui.hMin.value, 0, 360);
+            S.hMax = intClamp(ui.hMax.value, 0, 360);
+            ui.hMinRead.textContent = String(S.hMin);
+            ui.hMaxRead.textContent = String(S.hMax);
+          } else {
+            S.hCenter = intClamp(ui.hCenter.value, 0, 360);
+            S.hWidth = intClamp(ui.hWidth.value, 0, 360);
+            ui.hCenterRead.textContent = String(S.hCenter);
+            ui.hWidthRead.textContent = String(S.hWidth);
+            const r = deriveHueRange();
+            // also keep hMin/hMax in state for persistence/exports
+            S.hMin = r.hMin;
+            S.hMax = r.hMax;
+          }
+
+          saveState();
+
+          const {hMin, hMax} = deriveHueRange();
+          const wrap = hMin > hMax;
+
+          ui.wrapTag.textContent = wrap ? "wrap ON" : "no wrap";
+          ui.wrapRead.textContent = wrap ? "wrap: yes (red edge)" : "wrap: no";
+          setDot(ui.wrapDot, wrap ? "warn" : "good");
+
+          ui.hueSelA.style.display = "none";
+          ui.hueSelB.style.display = "none";
+
+          const pct = (deg)=> (clamp(deg,0,360) / 360) * 100;
+          if (!wrap){
+            const l = pct(hMin);
+            const r = pct(hMax);
+            ui.hueSelA.style.display = "block";
+            ui.hueSelA.style.left = l + "%";
+            ui.hueSelA.style.width = Math.max(0, r-l) + "%";
+          } else {
+            const l1 = pct(hMin);
+            ui.hueSelA.style.display = "block";
+            ui.hueSelA.style.left = l1 + "%";
+            ui.hueSelA.style.width = (100 - l1) + "%";
+            const r2 = pct(hMax);
+            ui.hueSelB.style.display = "block";
+            ui.hueSelB.style.left = "0%";
+            ui.hueSelB.style.width = r2 + "%";
+          }
+        }
+
+        ui.hueMode.onchange = updateHueUI;
+        ui.hMin.oninput = updateHueUI;
+        ui.hMax.oninput = updateHueUI;
+        ui.hCenter.oninput = updateHueUI;
+        ui.hWidth.oninput = updateHueUI;
+
+        ui.mode.onchange = ()=>{
+          S.mode = ui.mode.value === "outside" ? "outside" : "inside";
+          saveState();
+          recEvent("trigger_mode", {mode:S.mode});
+          if (S.mode === "outside"){
+            const {hMin, hMax} = deriveHueRange();
+            if (hMin === 0 && hMax === 360){
+              toast("Outside 0–360 never triggers. Narrow hue range.");
+            }
+          }
+        };
+
+        function syncThresh(){
+          S.sMin = clamp(ui.sMin.value, 0, 1);
+          S.vMin = clamp(ui.vMin.value, 0, 1);
+          S.debounceMs = intClamp(ui.debounce.value, 0, 60000);
+          S.holdMs = intClamp(ui.hold.value, 0, 60000);
+          S.cooldownMs = intClamp(ui.cooldown.value, 0, 60000);
+          saveState();
+          ui.timTag.textContent = `db ${S.debounceMs}ms · hold ${S.holdMs}ms · cd ${S.cooldownMs}ms · S≥${fmt(S.sMin,2)} · V≥${fmt(S.vMin,2)}`;
+          recEvent("trigger_thresh", {sMin:S.sMin, vMin:S.vMin, db:S.debounceMs, hold:S.holdMs, cd:S.cooldownMs});
+        }
+        ui.sMin.onchange = syncThresh;
+        ui.vMin.onchange = syncThresh;
+        ui.debounce.onchange = syncThresh;
+        ui.hold.onchange = syncThresh;
+        ui.cooldown.onchange = syncThresh;
+
+        ui.btnTryLock.onclick = async ()=>{
+          S.tryLock = !S.tryLock;
+          saveState();
+          ui.btnTryLock.textContent = `Lock: ${S.tryLock ? "ON" : "OFF"}`;
+          recEvent("tryLock", {on:S.tryLock});
+          if (camera.stream){
+            const track = camera.stream.getVideoTracks()[0];
+            await applyBestEffortLocks(track);
+            toast(S.tryLock ? "Tried lock AE/AWB" : "Lock disabled");
+          }
+        };
+
+        ui.btnArm.onclick = ()=>{
+          if (!camera.on) return;
+          camera.armed = !camera.armed;
+          S.armed = camera.armed;
+          saveState();
+          camera.lastStable = false;
+          camera.rawTrueSince = 0;
+          camera.lastFireAt = -Infinity;
+          recEvent("arm", {on: camera.armed});
+          toast(camera.armed ? "Armed" : "Disarmed");
+          refreshButtons();
+        };
+
+        function applyPreset(name){
+          if (name === "LED"){
+            S.sMin = 0.20; S.vMin = 0.10; S.debounceMs = 450; S.holdMs = 150; S.cooldownMs = 250; S.maxHz = 15;
+          } else if (name === "Screen"){
+            S.sMin = 0.10; S.vMin = 0.18; S.debounceMs = 250; S.holdMs = 0; S.cooldownMs = 100; S.maxHz = 30;
+          } else if (name === "Paper"){
+            S.sMin = 0.05; S.vMin = 0.25; S.debounceMs = 350; S.holdMs = 50; S.cooldownMs = 150; S.maxHz = 20;
+          } else if (name === "Neon"){
+            S.sMin = 0.30; S.vMin = 0.10; S.debounceMs = 300; S.holdMs = 100; S.cooldownMs = 200; S.maxHz = 20;
+          }
+          ui.sMin.value = String(S.sMin);
+          ui.vMin.value = String(S.vMin);
+          ui.debounce.value = String(S.debounceMs);
+          ui.hold.value = String(S.holdMs);
+          ui.cooldown.value = String(S.cooldownMs);
+
+          saveState();
+          recEvent("preset", {name});
+          toast(`Preset: ${name}`);
+
+          // apply maxHz in scan panel if mounted later
+          camera.maxHz = S.maxHz;
+          const cap = S.safeMode ? 10 : 60;
+          camera.actualHz = Math.min(camera.actualHz, Math.min(S.maxHz, cap));
+          syncThresh();
+          refreshButtons();
+        }
+
+        ui.preLED.onclick = ()=> applyPreset("LED");
+        ui.preScreen.onclick = ()=> applyPreset("Screen");
+        ui.prePaper.onclick = ()=> applyPreset("Paper");
+        ui.preNeon.onclick = ()=> applyPreset("Neon");
+
+        updateHueUI();
+        syncThresh();
+        refreshButtons();
+      }
+
+      if (which === "palette"){
+        ui.palStep = panels.palette.querySelector("#palStep");
+        ui.palStepRead = panels.palette.querySelector("#palStepRead");
+        ui.palMax = panels.palette.querySelector("#palMax");
+        ui.palSort = panels.palette.querySelector("#palSort");
+        ui.btnGate = panels.palette.querySelector("#btnGate");
+        ui.btnSelMode = panels.palette.querySelector("#btnSelMode");
+        ui.btnPalClear = panels.palette.querySelector("#btnPalClear");
+        ui.palSearch = panels.palette.querySelector("#palSearch");
+        ui.palGroup = panels.palette.querySelector("#palGroup");
+
+        ui.btnCopyHex = panels.palette.querySelector("#btnCopyHex");
+        ui.btnCopyCss = panels.palette.querySelector("#btnCopyCss");
+        ui.btnToSet = panels.palette.querySelector("#btnToSet");
+        ui.btnDelSel = panels.palette.querySelector("#btnDelSel");
+
+        ui.setSel = panels.palette.querySelector("#setSel");
+        ui.btnSetAdd = panels.palette.querySelector("#btnSetAdd");
+        ui.btnSetDel = panels.palette.querySelector("#btnSetDel");
+        ui.setTag = panels.palette.querySelector("#setTag");
+
+        ui.btnCluster = panels.palette.querySelector("#btnCluster");
+        ui.cluThr = panels.palette.querySelector("#cluThr");
+        ui.cluThrRead = panels.palette.querySelector("#cluThrRead");
+        ui.btnMerge = panels.palette.querySelector("#btnMerge");
+        ui.clusterOut = panels.palette.querySelector("#clusterOut");
+        ui.cluTag = panels.palette.querySelector("#cluTag");
+
+        ui.paletteGrid = panels.palette.querySelector("#paletteGrid");
+        ui.palTag = panels.palette.querySelector("#palTag");
+
+        ui.palStep.value = String(intClamp(S.palStep,1,32));
+        ui.palStepRead.textContent = ui.palStep.value;
+        ui.palMax.value = String(intClamp(S.palMax,10,2000));
+        ui.palSort.value = S.palSort || "count";
+        ui.btnGate.textContent = `Gate: ${S.palGateSV ? "ON" : "OFF"}`;
+        ui.palSearch.value = S.palSearch || "";
+        ui.palGroup.value = S.palGroup || "off";
+        ui.btnSelMode.textContent = `Select: ${palSelMode ? "ON" : "OFF"}`;
+
+        ui.palStep.oninput = ()=>{
+          S.palStep = intClamp(ui.palStep.value,1,32);
+          ui.palStepRead.textContent = String(S.palStep);
+          saveState();
+          renderPalette();
+        };
+        ui.palMax.onchange = ()=>{
+          S.palMax = intClamp(ui.palMax.value,10,2000);
+          saveState();
+          renderPalette();
+        };
+        ui.palSort.onchange = ()=>{
+          S.palSort = ui.palSort.value;
+          saveState();
+          renderPalette();
+        };
+        ui.btnGate.onclick = ()=>{
+          S.palGateSV = !S.palGateSV;
+          saveState();
+          recEvent("pal_gate", {on:S.palGateSV});
+          ui.btnGate.textContent = `Gate: ${S.palGateSV ? "ON" : "OFF"}`;
+        };
+        ui.btnSelMode.onclick = ()=>{
+          palSelMode = !palSelMode;
+          palSelected.clear();
+          ui.btnSelMode.textContent = `Select: ${palSelMode ? "ON" : "OFF"}`;
+          recEvent("select_mode", {on:palSelMode});
+          renderPalette();
+          refreshButtons();
+        };
+        ui.btnPalClear.onclick = ()=>{
+          paletteClear();
+          renderPalette();
+          toast("Palette cleared");
+        };
+        ui.palSearch.oninput = ()=>{
+          S.palSearch = ui.palSearch.value.slice(0, 64);
+          saveState();
+          renderPalette();
+        };
+        ui.palGroup.onchange = ()=>{
+          S.palGroup = ui.palGroup.value;
+          saveState();
+          renderPalette();
+        };
+
+        ui.btnCopyHex.onclick = async ()=>{
+          const keys = palSelMode && palSelected.size ? Array.from(palSelected) : null;
+          await copyText(paletteExportHexText(keys));
+        };
+        ui.btnCopyCss.onclick = async ()=>{
+          const keys = palSelMode && palSelected.size ? Array.from(palSelected) : null;
+          await copyText(paletteExportCssVars(keys));
+        };
+
+        ui.btnDelSel.onclick = ()=>{
+          if (!palSelected.size) return;
+          const del = Array.from(palSelected);
+          let removed = 0;
+          for (const k of del){
+            const it = palMap.get(k);
+            if (!it) continue;
+            if (it.pinned) continue;
+            palMap.delete(k);
+            removed++;
+            recEvent("palette_delete", {key:k});
+          }
+          palSelected.clear();
+          clusters = null;
+          paletteScheduleSave();
+          renderPalette();
+          toast(`Deleted ${removed} (unpinned)`);
+        };
+
+        renderSets();
+        ui.btnSetAdd.onclick = ()=>{
+          const name = (prompt("New set name (short):", "Set " + (Object.keys(S.sets.items).length + 1)) || "").trim();
+          if (!name) return;
+          if (S.sets.items[name]) return toast("Set exists");
+          S.sets.items[name] = [];
+          S.sets.active = name;
+          saveState();
+          recEvent("set_create", {name});
+          renderSets();
+          toast("Set created");
+        };
+        ui.btnSetDel.onclick = ()=>{
+          const name = ui.setSel.value;
+          if (!name || name === "Default") return toast("Can't delete Default");
+          if (!confirm(`Delete set "${name}"?`)) return;
+          delete S.sets.items[name];
+          S.sets.active = "Default";
+          saveState();
+          recEvent("set_delete", {name});
+          renderSets();
+          toast("Set deleted");
+          renderPalette();
+        };
+        ui.setSel.onchange = ()=>{
+          S.sets.active = ui.setSel.value;
+          saveState();
+          recEvent("set_active", {name:S.sets.active});
+          renderSets();
+          renderPalette();
+        };
+        ui.btnToSet.onclick = ()=>{
+          if (!palSelected.size) return;
+          const setName = S.sets.active || "Default";
+          const arr = S.sets.items[setName] || [];
+          for (const k of palSelected){
+            if (!arr.includes(k)) arr.push(k);
+          }
+          S.sets.items[setName] = arr.slice(0, 3000);
+          saveState();
+          recEvent("set_add_many", {set:setName, n:palSelected.size});
+          toast(`Moved to set: ${setName}`);
+          renderSets();
+        };
+
+        ui.btnCluster.onclick = ()=>{
+          clusterMode = !clusterMode;
+          ui.btnCluster.textContent = `Cluster: ${clusterMode ? "ON" : "OFF"}`;
+          ui.cluTag.textContent = clusterMode ? "on" : "off";
+          ui.clusterOut.style.display = clusterMode ? "block" : "none";
+          clusters = null;
+          renderPalette();
+          refreshButtons();
+        };
+        ui.cluThr.oninput = ()=>{
+          ui.cluThrRead.textContent = ui.cluThr.value;
+          clusters = null;
+          if (clusterMode) renderClusters();
+        };
+        ui.cluThrRead.textContent = ui.cluThr.value;
+
+        ui.btnMerge.onclick = ()=>{
+          if (!clusters || !clusters.length) return;
+          let removed = 0;
+          for (const cl of clusters){
+            if (cl.keys.length <= 1) continue;
+            const items = cl.keys.map(k=>palMap.get(k)).filter(Boolean);
+            items.sort((a,b)=> (b.count - a.count));
+            const keep = items[0];
+            for (let i=1;i<items.length;i++){
+              const it = items[i];
+              if (!it || it.pinned) continue;
+              palMap.delete(it.key);
+              removed++;
+              recEvent("cluster_merge_delete", {keep: keep.key, del: it.key});
+            }
+          }
+          clusters = null;
+          paletteScheduleSave();
+          renderPalette();
+          toast(`Merged clusters, removed ${removed}`);
+        };
+
+        renderPalette();
+        refreshButtons();
+      }
+
+      if (which === "export"){
+        ui.btnCopyHex2 = panels.export.querySelector("#btnCopyHex2");
+        ui.btnCopyCss2 = panels.export.querySelector("#btnCopyCss2");
+        ui.btnDlPalJson = panels.export.querySelector("#btnDlPalJson");
+        ui.btnDlPalCsv = panels.export.querySelector("#btnDlPalCsv");
+        ui.btnDlSessJson = panels.export.querySelector("#btnDlSessJson");
+        ui.btnDlSessCsv = panels.export.querySelector("#btnDlSessCsv");
+        ui.btnShareText = panels.export.querySelector("#btnShareText");
+        ui.btnShareFiles = panels.export.querySelector("#btnShareFiles");
+        ui.btnBundle = panels.export.querySelector("#btnBundle");
+        ui.btnReset = panels.export.querySelector("#btnReset");
+        ui.sysRead = panels.export.querySelector("#sysRead");
+        ui.shareTag = panels.export.querySelector("#shareTag");
+        ui.sysTag = panels.export.querySelector("#sysTag");
+        ui.selRead = panels.export.querySelector("#selRead");
+        ui.btnSelOnly = panels.export.querySelector("#btnSelOnly");
+
+        ui.btnSelOnly.onclick = ()=>{
+          S.exportSelectedOnly = !S.exportSelectedOnly;
+          saveState();
+          toast(`Selected only: ${S.exportSelectedOnly ? "ON" : "OFF"}`);
+          refreshButtons();
+        };
+
+        ui.btnCopyHex2.onclick = async ()=>{
+          const keys = (S.exportSelectedOnly && palSelMode && palSelected.size) ? Array.from(palSelected) : null;
+          await copyText(paletteExportHexText(keys));
+        };
+        ui.btnCopyCss2.onclick = async ()=>{
+          const keys = (S.exportSelectedOnly && palSelMode && palSelected.size) ? Array.from(palSelected) : null;
+          await copyText(paletteExportCssVars(keys));
+        };
+
+        ui.btnDlPalJson.onclick = ()=>{
+          const keys = (S.exportSelectedOnly && palSelMode && palSelected.size) ? Array.from(palSelected) : null;
+          downloadTextReliable(`palette_${stamp()}.json`, paletteJSON(keys), "application/json");
+        };
+        ui.btnDlPalCsv.onclick = ()=>{
+          const keys = (S.exportSelectedOnly && palSelMode && palSelected.size) ? Array.from(palSelected) : null;
+          downloadTextReliable(`palette_${stamp()}.csv`, paletteCSV(keys), "text/csv");
+        };
+
+        ui.btnDlSessJson.onclick = ()=> downloadTextReliable(`session_${stamp()}.json`, sessionJSON(), "application/json");
+        ui.btnDlSessCsv.onclick = ()=> downloadTextReliable(`session_${stamp()}.csv`, sessionCSV(), "text/csv");
+
+        ui.btnShareText.onclick = ()=> shareText();
+        ui.btnShareFiles.onclick = ()=> shareFiles();
+        ui.btnBundle.onclick = ()=> exportBundle();
+
+        ui.btnReset.onclick = ()=>{
+          if (!confirm("Reset all stored data (settings + palette + sets)?")) return;
+          try{
+            localStorage.removeItem(APP.keyState);
+            localStorage.removeItem(APP.keyPalette);
+            localStorage.removeItem("cc_trigger_palette_v3");
+            localStorage.removeItem("cc_trigger_palette_v3_palette");
+          }catch(_){}
+          toast("Reset complete (reload)");
+        };
+
+        const sysBits = [];
+        sysBits.push(`UA: ${navigator.userAgent}`);
+        sysBits.push(`gUM: ${navigator.mediaDevices?.getUserMedia ? "yes" : "no"}`);
+        sysBits.push(`Clipboard: ${navigator.clipboard ? "yes" : "fallback"}`);
+        sysBits.push(`Share: ${navigator.share ? "yes" : "no"}`);
+        sysBits.push(`iOS: ${isIOS() ? "yes" : "no"}`);
+        ui.sysRead.textContent = sysBits.join(" | ");
+        ui.sysTag.textContent = "ok";
+        ui.shareTag.textContent = navigator.share ? "supported" : "no";
+
+        refreshButtons(true);
+      }
+
+      // Always enforce ROI lock UI text
+      if (ui.btnLockRoi){
+        ui.btnLockRoi.textContent = S.roiLocked ? "Lock ROI: ON" : "Lock ROI";
+      }
+      if (ui.btnRoiCenterLock){
+        ui.btnRoiCenterLock.textContent = `Center lock: ${S.roiCenterLock ? "ON" : "OFF"}`;
+      }
+    }
+
+    /* ---------------------------- Trigger + UI behavior bridging ---------------------------- */
+    function updateArmedFromState(){
+      camera.armed = !!S.armed;
+      camera.lastStable = false;
+      camera.rawTrueSince = 0;
+      camera.lastFireAt = -Infinity;
+    }
+    updateArmedFromState();
+
+    /* ---------------------------- Boot ---------------------------- */
+    paletteLoad(); // persistent palette
+    sheetSetSnap(0.55);
+    setRoiLocked(S.roiLocked);
+    setRoiCenterLock(S.roiCenterLock);
+    setTab(S.tab || "scan");
+
+    // prime permission label
+    // (camera permission API is not reliable across iOS; keep simple)
+    requestAnimationFrame(()=> {
+      if (S.tab === "scan"){
+        const permRead = panels.scan.querySelector("#permRead");
+        const permDot = panels.scan.querySelector("#permDot");
+        if (permRead && permDot){
+          permRead.textContent = navigator.mediaDevices?.getUserMedia ? "permissions: ready" : "permissions: unsupported";
+          setDot(permDot, navigator.mediaDevices?.getUserMedia ? "good" : "bad");
+        }
+      }
+    });
+
+    wireEnabled(false);
+    refreshButtons(true);
+
+    // Kick RAF loop
+    requestAnimationFrame(rafLoop);
+
+    // Ensure ROI preset store exists (so Reset works pre-camera too)
+    ensurePresetStore();
+    saveState();
+
+    /* ---------------------------- Notes: Offline-only & zero deps ----------------------------
+      - No external resources
+      - No network calls (CSP connect-src none)
+      - Bounded arrays: session rows/events, history ring, palette max + compact persistence
+      - UI updates throttled; sampling adaptive; robust mean reduces outlier spikes
+      - Camera stopped on hide/unload; best-effort auto-restart on show (permission allowing)
+    ---------------------------------------------------------------------------------------- */
+  })();
+  </script>
+</body>
+</html>
